@@ -1,25 +1,77 @@
+/**
+ * @fileoverview 聊天输入框组件 - Cline WebView 的核心输入组件
+ *
+ * 本文件实现了 Cline 聊天界面的文本输入区域，是用户与 AI 助手交互的主要入口。
+ *
+ * 主要功能：
+ * 1. 文本输入与自动调整大小
+ * 2. @ 提及功能 - 引用文件、文件夹、Git 提交等上下文
+ * 3. / 斜杠命令 - 快速执行预定义的工作流命令
+ * 4. 图片/文件拖放与粘贴支持
+ * 5. Plan/Act 模式切换 - 切换计划模式和执行模式
+ * 6. 语法高亮 - 高亮显示 @提及 和 /命令
+ *
+ * 组件架构：
+ * ┌─────────────────────────────────────────────────────────┐
+ * │  ChatTextArea (主组件)                                   │
+ * │  ├── ContextMenu (@ 提及下拉菜单)                        │
+ * │  ├── SlashCommandMenu (/ 命令下拉菜单)                   │
+ * │  ├── DynamicTextArea (自动调整高度的文本框)               │
+ * │  ├── Thumbnails (已选择的图片/文件缩略图)                 │
+ * │  └── Plan/Act 模式切换开关                               │
+ * └─────────────────────────────────────────────────────────┘
+ */
+
+// ==================== 外部依赖导入 ====================
+
+// 共享模块 - 上下文提及相关正则表达式
 import { mentionRegex, mentionRegexGlobal } from "@shared/context-mentions"
+// 共享模块 - Protocol Buffers 消息类型
 import { StringRequest } from "@shared/proto/cline/common"
 import { FileSearchRequest, FileSearchType, RelativePathsRequest } from "@shared/proto/cline/file"
 import { PlanActMode, TogglePlanActModeRequest } from "@shared/proto/cline/state"
+// 共享模块 - 斜杠命令和模式类型
 import { type SlashCommand } from "@shared/slashCommands"
 import { Mode } from "@shared/storage/types"
+
+// VS Code WebView UI 工具包
 import { VSCodeButton } from "@vscode/webview-ui-toolkit/react"
+// 图标库
 import { AtSignIcon, PlusIcon } from "lucide-react"
+// React 核心
 import type React from "react"
 import { forwardRef, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react"
+// 自动调整大小的文本框组件
 import DynamicTextArea from "react-textarea-autosize"
+// CSS-in-JS 样式库
 import styled from "styled-components"
+
+// ==================== 内部组件导入 ====================
+
+// 上下文菜单 - 显示 @ 提及选项
 import ContextMenu from "@/components/chat/ContextMenu"
+// 聊天常量配置
 import { CHAT_CONSTANTS } from "@/components/chat/chat-view/constants"
+// 斜杠命令菜单 - 显示 / 命令选项
 import SlashCommandMenu from "@/components/chat/SlashCommandMenu"
+// 缩略图组件 - 显示已选择的图片和文件
 import Thumbnails from "@/components/common/Thumbnails"
+// 设置相关工具函数
 import { getModeSpecificFields, normalizeApiConfiguration } from "@/components/settings/utils/providerUtils"
+// 工具提示组件
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
+// 扩展状态上下文
 import { useExtensionState } from "@/context/ExtensionStateContext"
+// 平台上下文
 import { usePlatform } from "@/context/PlatformContext"
+// 样式工具函数
 import { cn } from "@/lib/utils"
+// gRPC 客户端服务
 import { FileServiceClient, StateServiceClient } from "@/services/grpc-client"
+
+// ==================== 工具函数导入 ====================
+
+// 上下文提及相关工具
 import {
 	ContextMenuOptionType,
 	getContextMenuOptionIndex,
@@ -30,8 +82,11 @@ import {
 	type SearchResult,
 	shouldShowContextMenu,
 } from "@/utils/context-mentions"
+// 快捷键相关 hooks
 import { useMetaKeyDetection, useShortcut } from "@/utils/hooks"
+// 平台检测工具
 import { isSafari } from "@/utils/platformUtils"
+// 斜杠命令相关工具
 import {
 	getMatchingSlashCommands,
 	insertSlashCommand,
@@ -41,15 +96,34 @@ import {
 	slashCommandRegexGlobal,
 	validateSlashCommand,
 } from "@/utils/slash-commands"
+
+// ==================== 子组件导入 ====================
+
+// Cline 规则切换模态框
 import ClineRulesToggleModal from "../cline-rules/ClineRulesToggleModal"
+// 服务器切换模态框
 import ServersToggleModal from "./ServersToggleModal"
 
+// ==================== 常量定义 ====================
+
+/** 每条消息允许的最大图片和文件数量 */
 const { MAX_IMAGES_AND_FILES_PER_MESSAGE } = CHAT_CONSTANTS
 
+/**
+ * 获取图片尺寸并验证是否超出限制
+ *
+ * Anthropic API 对图片尺寸有限制，超过 7500px 的图片会导致请求失败。
+ * 此函数在图片被添加到消息前进行预检查。
+ *
+ * @param dataUrl - 图片的 Base64 Data URL
+ * @returns Promise<{width, height}> - 图片尺寸
+ * @throws Error - 当图片尺寸超过 7500px 或加载失败时
+ */
 const getImageDimensions = (dataUrl: string): Promise<{ width: number; height: number }> => {
 	return new Promise((resolve, reject) => {
 		const img = new Image()
 		img.onload = () => {
+			// 检查图片尺寸是否超过 API 限制
 			if (img.naturalWidth > 7500 || img.naturalHeight > 7500) {
 				reject(new Error("Image dimensions exceed maximum allowed size of 7500px."))
 			} else {
@@ -64,36 +138,80 @@ const getImageDimensions = (dataUrl: string): Promise<{ width: number; height: n
 	})
 }
 
-// Set to "File" option by default
+/** 上下文菜单默认选中"文件"选项 */
 const DEFAULT_CONTEXT_MENU_OPTION = getContextMenuOptionIndex(ContextMenuOptionType.File)
 
+// ==================== 类型定义 ====================
+
+/**
+ * ChatTextArea 组件属性接口
+ *
+ * 定义了聊天输入框所需的所有属性，包括：
+ * - 输入状态管理
+ * - 文件/图片选择
+ * - 发送控制
+ * - 高度变化回调
+ */
 interface ChatTextAreaProps {
+	/** 当前输入框的文本值 */
 	inputValue: string
+	/** 当前激活的引用文本（用于引用消息功能） */
 	activeQuote: string | null
+	/** 更新输入值的函数 */
 	setInputValue: (value: string) => void
+	/** 是否禁用发送按钮 */
 	sendingDisabled: boolean
+	/** 输入框占位符文本 */
 	placeholderText: string
+	/** 已选择的文件路径列表 */
 	selectedFiles: string[]
+	/** 已选择的图片 Data URL 列表 */
 	selectedImages: string[]
+	/** 更新已选图片的函数 */
 	setSelectedImages: React.Dispatch<React.SetStateAction<string[]>>
+	/** 更新已选文件的函数 */
 	setSelectedFiles: React.Dispatch<React.SetStateAction<string[]>>
+	/** 发送消息的回调函数 */
 	onSend: () => void
+	/** 打开文件/图片选择对话框的回调 */
 	onSelectFilesAndImages: () => void
+	/** 是否禁用文件/图片选择（达到数量上限时） */
 	shouldDisableFilesAndImages: boolean
+	/** 输入框高度变化时的回调 */
 	onHeightChange?: (height: number) => void
+	/** 输入框焦点状态变化时的回调 */
 	onFocusChange?: (isFocused: boolean) => void
 }
 
+/**
+ * Git 提交信息接口
+ *
+ * 用于在上下文菜单中显示 Git 提交记录
+ */
 interface GitCommit {
+	/** 选项类型标识 */
 	type: ContextMenuOptionType.Git
+	/** 完整的提交哈希值 */
 	value: string
+	/** 提交标题（显示在菜单中） */
 	label: string
+	/** 提交描述（短哈希、作者、日期） */
 	description: string
 }
 
+// ==================== 样式常量 ====================
+
+/** Plan 模式的主题颜色（警告色/橙色） */
 const PLAN_MODE_COLOR = "var(--vscode-activityWarningBadge-background)"
+/** Act 模式的主题颜色（焦点边框色/蓝色） */
 const ACT_MODE_COLOR = "var(--vscode-focusBorder)"
 
+// ==================== Styled Components 样式组件 ====================
+
+/**
+ * Plan/Act 模式切换开关容器
+ * 包含两个模式选项和滑动指示器
+ */
 const SwitchContainer = styled.div<{ disabled: boolean }>`
 	display: flex;
 	align-items: center;
@@ -106,10 +224,15 @@ const SwitchContainer = styled.div<{ disabled: boolean }>`
 	transform: scale(1);
 	transform-origin: right center;
 	margin-left: 0;
-	user-select: none; // Prevent text selection
+	user-select: none; /* 防止文本被选中 */
 `
 
+/**
+ * 模式切换滑块
+ * 根据当前模式在 Plan 和 Act 之间滑动
+ */
 const Slider = styled.div.withConfig({
+	// 过滤自定义属性，避免传递到 DOM
 	shouldForwardProp: (prop) => !["isAct", "isPlan"].includes(prop),
 })<{ isAct: boolean; isPlan?: boolean }>`
 	position: absolute;
@@ -120,6 +243,7 @@ const Slider = styled.div.withConfig({
 	transform: translateX(${(props) => (props.isAct ? "100%" : "0%")});
 `
 
+/** 底部按钮组容器 - 包含 @、+、服务器、规则等按钮 */
 const ButtonGroup = styled.div`
 	display: flex;
 	align-items: center;
@@ -128,6 +252,7 @@ const ButtonGroup = styled.div`
 	min-width: 0;
 `
 
+/** 单个按钮内容容器 */
 const ButtonContainer = styled.div`
 	display: flex;
 	align-items: center;
@@ -138,6 +263,7 @@ const ButtonContainer = styled.div`
 	width: 100%;
 `
 
+/** 模型显示区域容器 */
 const ModelContainer = styled.div`
 	position: relative;
 	display: flex;
@@ -145,12 +271,17 @@ const ModelContainer = styled.div`
 	min-width: 0;
 `
 
+/** 模型按钮包装器 - 控制收缩行为 */
 const ModelButtonWrapper = styled.div`
-	display: inline-flex; // Make it shrink to content
-	min-width: 0; // Allow shrinking
-	max-width: 100%; // Don't overflow parent
+	display: inline-flex; /* 收缩到内容大小 */
+	min-width: 0; /* 允许收缩 */
+	max-width: 100%; /* 不溢出父容器 */
 `
 
+/**
+ * 模型显示按钮
+ * 点击后跳转到 API 设置页面选择模型
+ */
 const ModelDisplayButton = styled.a<{ isActive?: boolean; disabled?: boolean }>`
 	padding: 0px 0px;
 	height: 20px;
@@ -185,6 +316,7 @@ const ModelDisplayButton = styled.a<{ isActive?: boolean; disabled?: boolean }>`
 	}
 `
 
+/** 模型名称文本内容 - 处理文本溢出 */
 const ModelButtonContent = styled.div`
 	width: 100%;
 	min-width: 0;
@@ -193,6 +325,21 @@ const ModelButtonContent = styled.div`
 	white-space: nowrap;
 `
 
+// ==================== 主组件定义 ====================
+
+/**
+ * ChatTextArea 聊天输入框组件
+ *
+ * 这是 Cline 聊天界面的核心输入组件，支持：
+ * - 多行文本输入与自动高度调整
+ * - @ 提及（文件、文件夹、Git 提交、终端输出等）
+ * - / 斜杠命令（预定义工作流）
+ * - 图片/文件拖放和粘贴
+ * - Plan/Act 模式切换
+ * - 语法高亮显示
+ *
+ * 使用 forwardRef 以支持父组件获取 textarea 引用
+ */
 const ChatTextArea = forwardRef<HTMLTextAreaElement, ChatTextAreaProps>(
 	(
 		{
@@ -212,59 +359,114 @@ const ChatTextArea = forwardRef<HTMLTextAreaElement, ChatTextAreaProps>(
 		},
 		ref,
 	) => {
+		// ==================== 扩展状态获取 ====================
 		const {
-			mode,
-			apiConfiguration,
-			openRouterModels,
-			platform,
-			localWorkflowToggles,
-			globalWorkflowToggles,
-			remoteWorkflowToggles,
-			remoteConfigSettings,
-			navigateToSettingsModelPicker,
-			mcpServers,
+			mode, // 当前模式：plan 或 act
+			apiConfiguration, // API 配置信息
+			openRouterModels, // OpenRouter 可用模型列表
+			platform, // 当前运行平台
+			localWorkflowToggles, // 本地工作流开关状态
+			globalWorkflowToggles, // 全局工作流开关状态
+			remoteWorkflowToggles, // 远程工作流开关状态
+			remoteConfigSettings, // 远程配置设置
+			navigateToSettingsModelPicker, // 导航到模型选择器的函数
+			mcpServers, // MCP 服务器列表
 		} = useExtensionState()
+
+		// ==================== 组件状态定义 ====================
+
+		// 文本框焦点状态
 		const [isTextAreaFocused, setIsTextAreaFocused] = useState(false)
+		// 拖放状态 - 是否有文件正在拖动到输入区域
 		const [isDraggingOver, setIsDraggingOver] = useState(false)
+		// Git 提交记录列表 - 用于 @ 提及 Git 提交
 		const [gitCommits, setGitCommits] = useState<GitCommit[]>([])
+
+		// ===== 斜杠命令菜单状态 =====
+		/** 是否显示斜杠命令菜单 */
 		const [showSlashCommandsMenu, setShowSlashCommandsMenu] = useState(false)
+		/** 当前选中的斜杠命令索引 */
 		const [selectedSlashCommandsIndex, setSelectedSlashCommandsIndex] = useState(0)
+		/** 斜杠命令搜索查询 */
 		const [slashCommandsQuery, setSlashCommandsQuery] = useState("")
+		/** 斜杠命令菜单容器引用 */
 		const slashCommandsMenuContainerRef = useRef<HTMLDivElement>(null)
 
+		// ===== 布局相关状态 =====
+		/** 缩略图区域高度 - 用于计算文本框 padding */
 		const [thumbnailsHeight, setThumbnailsHeight] = useState(0)
+		/** 文本框基础高度 - 用于定位发送按钮 */
 		const [textAreaBaseHeight, setTextAreaBaseHeight] = useState<number | undefined>(undefined)
+
+		// ===== 上下文菜单状态 =====
+		/** 是否显示上下文菜单（@ 提及） */
 		const [showContextMenu, setShowContextMenu] = useState(false)
+		/** 当前光标位置 */
 		const [cursorPosition, setCursorPosition] = useState(0)
+		/** 搜索查询文本 */
 		const [searchQuery, setSearchQuery] = useState("")
+		/** 文本框 DOM 引用 */
 		const textAreaRef = useRef<HTMLTextAreaElement | null>(null)
+		/** 鼠标是否按下在菜单上 - 防止失焦关闭菜单 */
 		const [isMouseDownOnMenu, setIsMouseDownOnMenu] = useState(false)
+		/** 高亮层 DOM 引用 - 用于渲染语法高亮 */
 		const highlightLayerRef = useRef<HTMLDivElement>(null)
+		/** 当前选中的菜单项索引 */
 		const [selectedMenuIndex, setSelectedMenuIndex] = useState(-1)
+		/** 当前选中的上下文类型（文件/文件夹/Git 等） */
 		const [selectedType, setSelectedType] = useState<ContextMenuOptionType | null>(null)
+
+		// ===== 删除行为追踪状态 =====
+		/** 是否刚删除了 @提及 后的空格 - 用于实现两次退格删除提及 */
 		const [justDeletedSpaceAfterMention, setJustDeletedSpaceAfterMention] = useState(false)
+		/** 是否刚删除了 /命令 后的空格 */
 		const [justDeletedSpaceAfterSlashCommand, setJustDeletedSpaceAfterSlashCommand] = useState(false)
+		/** 预期的光标位置 - 用于在状态更新后设置光标 */
 		const [intendedCursorPosition, setIntendedCursorPosition] = useState<number | null>(null)
+		/** 上下文菜单容器引用 */
 		const contextMenuContainerRef = useRef<HTMLDivElement>(null)
 
+		// ===== 工具提示和待处理状态 =====
+		/** 当前显示工具提示的模式 */
 		const [shownTooltipMode, setShownTooltipMode] = useState<Mode | null>(null)
+		/** 待插入的文件路径队列 - 用于批量拖放文件 */
 		const [pendingInsertions, setPendingInsertions] = useState<string[]>([])
+		/** Shift 键长按计时器引用 */
 		const _shiftHoldTimerRef = useRef<NodeJS.Timeout | null>(null)
+
+		// ===== 错误提示状态 =====
+		/** 是否显示不支持文件类型的错误 */
 		const [showUnsupportedFileError, setShowUnsupportedFileError] = useState(false)
+		/** 不支持文件错误计时器引用 */
 		const unsupportedFileTimerRef = useRef<NodeJS.Timeout | null>(null)
+		/** 是否显示图片尺寸超限错误 */
 		const [showDimensionError, setShowDimensionError] = useState(false)
+		/** 图片尺寸错误计时器引用 */
 		const dimensionErrorTimerRef = useRef<NodeJS.Timeout | null>(null)
 
+		// ===== 文件搜索状态 =====
+		/** 文件搜索结果列表 */
 		const [fileSearchResults, setFileSearchResults] = useState<SearchResult[]>([])
+		/** 搜索加载中状态 */
 		const [searchLoading, setSearchLoading] = useState(false)
+		/** 获取平台特定的 Meta 键字符（⌘ 或 Ctrl） */
 		const [, metaKeyChar] = useMetaKeyDetection(platform)
 
-		// Fetch git commits when Git is selected or when typing a hash
+		// ==================== 副作用 Hooks ====================
+
+		/**
+		 * 获取 Git 提交记录
+		 *
+		 * 当用户选择 Git 类型或输入看起来像 Git 哈希的内容时，
+		 * 从后端获取匹配的 Git 提交记录用于上下文菜单显示。
+		 */
 		useEffect(() => {
+			// 检查是否选择了 Git 类型，或者输入内容匹配十六进制哈希格式
 			if (selectedType === ContextMenuOptionType.Git || /^[a-f0-9]+$/i.test(searchQuery)) {
 				FileServiceClient.searchCommits(StringRequest.create({ value: searchQuery || "" }))
 					.then((response) => {
 						if (response.commits) {
+							// 将后端响应转换为 GitCommit 格式
 							const commits: GitCommit[] = response.commits.map(
 								(commit: { hash: string; shortHash: string; subject: string; author: string; date: string }) => ({
 									type: ContextMenuOptionType.Git,
@@ -282,14 +484,24 @@ const ChatTextArea = forwardRef<HTMLTextAreaElement, ChatTextAreaProps>(
 			}
 		}, [selectedType, searchQuery])
 
+		/**
+		 * 上下文菜单的查询项列表
+		 *
+		 * 合并固定选项（Problems、Terminal）和动态获取的 Git 提交记录
+		 */
 		const queryItems = useMemo(() => {
 			return [
-				{ type: ContextMenuOptionType.Problems, value: "problems" },
-				{ type: ContextMenuOptionType.Terminal, value: "terminal" },
-				...gitCommits,
+				{ type: ContextMenuOptionType.Problems, value: "problems" }, // 诊断问题
+				{ type: ContextMenuOptionType.Terminal, value: "terminal" }, // 终端输出
+				...gitCommits, // Git 提交记录
 			]
 		}, [gitCommits])
 
+		/**
+		 * 点击外部关闭上下文菜单
+		 *
+		 * 当用户点击上下文菜单外部区域时，自动关闭菜单
+		 */
 		useEffect(() => {
 			const handleClickOutside = (event: MouseEvent) => {
 				if (contextMenuContainerRef.current && !contextMenuContainerRef.current.contains(event.target as Node)) {
@@ -306,6 +518,11 @@ const ChatTextArea = forwardRef<HTMLTextAreaElement, ChatTextAreaProps>(
 			}
 		}, [showContextMenu, setShowContextMenu])
 
+		/**
+		 * 点击外部关闭斜杠命令菜单
+		 *
+		 * 当用户点击斜杠命令菜单外部区域时，自动关闭菜单
+		 */
 		useEffect(() => {
 			const handleClickOutsideSlashMenu = (event: MouseEvent) => {
 				if (
@@ -325,27 +542,43 @@ const ChatTextArea = forwardRef<HTMLTextAreaElement, ChatTextAreaProps>(
 			}
 		}, [showSlashCommandsMenu])
 
+		// ==================== 回调函数定义 ====================
+
+		/**
+		 * 处理上下文菜单项选择
+		 *
+		 * 当用户从 @ 提及菜单中选择一个选项时调用。
+		 * 根据选项类型执行不同的操作：
+		 * - 文件/文件夹/Git：如果没有具体值，进入该类型的搜索模式；否则插入提及
+		 * - URL/Problems/Terminal：直接插入对应的提及
+		 *
+		 * @param type - 选择的选项类型
+		 * @param value - 选项的具体值（可选）
+		 */
 		const handleMentionSelect = useCallback(
 			(type: ContextMenuOptionType, value?: string) => {
+				// 忽略"无结果"选项的点击
 				if (type === ContextMenuOptionType.NoResults) {
 					return
 				}
 
+				// 处理需要进一步选择的类型（文件、文件夹、Git）
 				if (
 					type === ContextMenuOptionType.File ||
 					type === ContextMenuOptionType.Folder ||
 					type === ContextMenuOptionType.Git
 				) {
+					// 如果没有具体值，进入该类型的搜索模式
 					if (!value) {
 						setSelectedType(type)
 						setSearchQuery("")
 						setSelectedMenuIndex(0)
 
-						// Trigger search with the selected type
+						// 触发文件搜索以显示初始结果
 						if (type === ContextMenuOptionType.File || type === ContextMenuOptionType.Folder) {
 							setSearchLoading(true)
 
-							// Map ContextMenuOptionType to FileSearchType enum
+							// 将上下文菜单类型映射到文件搜索类型枚举
 							let searchType: FileSearchType | undefined
 							if (type === ContextMenuOptionType.File) {
 								searchType = FileSearchType.FILE
@@ -374,12 +607,14 @@ const ChatTextArea = forwardRef<HTMLTextAreaElement, ChatTextAreaProps>(
 					}
 				}
 
+				// 关闭菜单并重置状态
 				setShowContextMenu(false)
 				setSelectedType(null)
 				const queryLength = searchQuery.length
 				setSearchQuery("")
 
 				if (textAreaRef.current) {
+					// 根据类型确定要插入的值
 					let insertValue = value || ""
 					if (type === ContextMenuOptionType.URL) {
 						insertValue = value || ""
@@ -393,6 +628,7 @@ const ChatTextArea = forwardRef<HTMLTextAreaElement, ChatTextAreaProps>(
 						insertValue = value || ""
 					}
 
+					// 在文本中插入提及
 					const { newValue, mentionIndex } = insertMention(
 						textAreaRef.current.value,
 						cursorPosition,
@@ -400,13 +636,13 @@ const ChatTextArea = forwardRef<HTMLTextAreaElement, ChatTextAreaProps>(
 						queryLength,
 					)
 
+					// 更新输入值和光标位置
 					setInputValue(newValue)
 					const newCursorPosition = newValue.indexOf(" ", mentionIndex + insertValue.length) + 1
 					setCursorPosition(newCursorPosition)
 					setIntendedCursorPosition(newCursorPosition)
-					// textAreaRef.current.focus()
 
-					// scroll to cursor
+					// 滚动到光标位置（通过失焦再聚焦实现）
 					setTimeout(() => {
 						if (textAreaRef.current) {
 							textAreaRef.current.blur()
@@ -418,25 +654,37 @@ const ChatTextArea = forwardRef<HTMLTextAreaElement, ChatTextAreaProps>(
 			[setInputValue, cursorPosition, searchQuery],
 		)
 
+		/**
+		 * 处理斜杠命令选择
+		 *
+		 * 当用户从 / 命令菜单中选择一个命令时调用。
+		 * 将选中的命令插入到输入框中，并设置光标到命令末尾。
+		 *
+		 * @param command - 选中的斜杠命令对象
+		 */
 		const handleSlashCommandsSelect = useCallback(
 			(command: SlashCommand) => {
+				// 关闭菜单并重置状态
 				setShowSlashCommandsMenu(false)
 				const queryLength = slashCommandsQuery.length
 				setSlashCommandsQuery("")
 
 				if (textAreaRef.current) {
+					// 在文本中插入斜杠命令
 					const { newValue, commandIndex } = insertSlashCommand(
 						textAreaRef.current.value,
 						command.name,
 						queryLength,
 						cursorPosition,
 					)
+					// 将光标移动到命令后的空格之后
 					const newCursorPosition = newValue.indexOf(" ", commandIndex + 1 + command.name.length) + 1
 
 					setInputValue(newValue)
 					setCursorPosition(newCursorPosition)
 					setIntendedCursorPosition(newCursorPosition)
 
+					// 滚动到光标位置
 					setTimeout(() => {
 						if (textAreaRef.current) {
 							textAreaRef.current.blur()
@@ -447,8 +695,21 @@ const ChatTextArea = forwardRef<HTMLTextAreaElement, ChatTextAreaProps>(
 			},
 			[setInputValue, slashCommandsQuery, cursorPosition],
 		)
+		/**
+		 * 处理键盘按下事件
+		 *
+		 * 这是输入框的核心键盘事件处理器，负责处理：
+		 * - Cmd/Ctrl+A：全选文本
+		 * - 方向键：在菜单中导航
+		 * - Enter/Tab：选择菜单项或发送消息
+		 * - Escape：关闭菜单
+		 * - Backspace：删除 @提及 或 /命令
+		 *
+		 * @param event - React 键盘事件
+		 */
 		const handleKeyDown = useCallback(
 			(event: React.KeyboardEvent<HTMLTextAreaElement>) => {
+				// 处理 Cmd/Ctrl+A 全选快捷键
 				const isSelectAllShortcut =
 					(event.metaKey || event.ctrlKey) && !event.shiftKey && !event.altKey && event.key.toLowerCase() === "a"
 				if (isSelectAllShortcut) {
@@ -460,18 +721,21 @@ const ChatTextArea = forwardRef<HTMLTextAreaElement, ChatTextAreaProps>(
 					return
 				}
 
+				// ===== 斜杠命令菜单的键盘导航 =====
 				if (showSlashCommandsMenu) {
+					// Escape 键关闭菜单
 					if (event.key === "Escape") {
 						setShowSlashCommandsMenu(false)
 						setSlashCommandsQuery("")
 						return
 					}
 
+					// 上下方向键在命令列表中导航
 					if (event.key === "ArrowUp" || event.key === "ArrowDown") {
 						event.preventDefault()
 						setSelectedSlashCommandsIndex((prevIndex) => {
 							const direction = event.key === "ArrowUp" ? -1 : 1
-							// Get commands with workflow toggles
+							// 获取匹配当前查询的所有命令
 							const allCommands = getMatchingSlashCommands(
 								slashCommandsQuery,
 								localWorkflowToggles,
@@ -485,16 +749,16 @@ const ChatTextArea = forwardRef<HTMLTextAreaElement, ChatTextAreaProps>(
 								return prevIndex
 							}
 
-							// Calculate total command count
 							const totalCommandCount = allCommands.length
 
-							// Create wraparound navigation - moves from last item to first and vice versa
+							// 循环导航 - 从最后一项到第一项，反之亦然
 							const newIndex = (prevIndex + direction + totalCommandCount) % totalCommandCount
 							return newIndex
 						})
 						return
 					}
 
+					// Enter 或 Tab 键选择当前高亮的命令
 					if ((event.key === "Enter" || event.key === "Tab") && selectedSlashCommandsIndex !== -1) {
 						event.preventDefault()
 						const commands = getMatchingSlashCommands(
@@ -511,7 +775,9 @@ const ChatTextArea = forwardRef<HTMLTextAreaElement, ChatTextAreaProps>(
 						return
 					}
 				}
+				// ===== 上下文菜单（@ 提及）的键盘导航 =====
 				if (showContextMenu) {
+					// Escape 键关闭菜单并重置状态
 					if (event.key === "Escape") {
 						setShowContextMenu(false)
 						setSelectedType(null)
@@ -520,6 +786,7 @@ const ChatTextArea = forwardRef<HTMLTextAreaElement, ChatTextAreaProps>(
 						return
 					}
 
+					// 上下方向键在选项列表中导航
 					if (event.key === "ArrowUp" || event.key === "ArrowDown") {
 						event.preventDefault()
 						setSelectedMenuIndex((prevIndex) => {
@@ -531,27 +798,29 @@ const ChatTextArea = forwardRef<HTMLTextAreaElement, ChatTextAreaProps>(
 								return prevIndex
 							}
 
-							// Find selectable options (non-URL types)
+							// 找出可选择的选项（排除 URL 和无结果提示）
 							const selectableOptions = options.filter(
 								(option) =>
 									option.type !== ContextMenuOptionType.URL && option.type !== ContextMenuOptionType.NoResults,
 							)
 
 							if (selectableOptions.length === 0) {
-								return -1 // No selectable options
+								return -1 // 没有可选择的选项
 							}
 
-							// Find the index of the next selectable option
+							// 计算下一个可选择选项的索引
 							const currentSelectableIndex = selectableOptions.indexOf(options[prevIndex])
 
 							const newSelectableIndex =
 								(currentSelectableIndex + direction + selectableOptions.length) % selectableOptions.length
 
-							// Find the index of the selected option in the original options array
+							// 返回选中选项在原始数组中的索引
 							return options.indexOf(selectableOptions[newSelectableIndex])
 						})
 						return
 					}
+
+					// Enter 或 Tab 键选择当前高亮的选项
 					if ((event.key === "Enter" || event.key === "Tab") && selectedMenuIndex !== -1) {
 						event.preventDefault()
 						const selectedOption = getContextMenuOptions(searchQuery, selectedType, queryItems, fileSearchResults)[
@@ -562,7 +831,7 @@ const ChatTextArea = forwardRef<HTMLTextAreaElement, ChatTextAreaProps>(
 							selectedOption.type !== ContextMenuOptionType.URL &&
 							selectedOption.type !== ContextMenuOptionType.NoResults
 						) {
-							// Use label if it contains workspace prefix, otherwise use value
+							// 如果 label 包含工作区前缀，使用 label；否则使用 value
 							const mentionValue = selectedOption.label?.includes(":") ? selectedOption.label : selectedOption.value
 							handleMentionSelect(selectedOption.type, mentionValue)
 						}
@@ -570,32 +839,39 @@ const ChatTextArea = forwardRef<HTMLTextAreaElement, ChatTextAreaProps>(
 					}
 				}
 
-				// Safari does not support InputEvent.isComposing (always false), so we need to fallback to keyCode === 229 for it
+				// ===== Enter 键发送消息 =====
+				// Safari 不支持 InputEvent.isComposing（始终为 false），所以需要使用 keyCode === 229 作为后备方案
+				// keyCode 229 表示正在使用输入法编辑器（IME）输入
 				const isComposing = isSafari ? event.nativeEvent.keyCode === 229 : (event.nativeEvent?.isComposing ?? false)
 				if (event.key === "Enter" && !event.shiftKey && !isComposing) {
 					event.preventDefault()
 
+					// 只有在发送未被禁用时才发送消息
 					if (!sendingDisabled) {
 						setIsTextAreaFocused(false)
 						onSend()
 					}
 				}
 
+				// ===== Backspace 键删除 @提及 或 /命令 =====
+				// 实现两次退格删除整个提及/命令的行为：
+				// 第一次退格删除提及后的空格，第二次退格删除整个提及
 				if (event.key === "Backspace" && !isComposing) {
 					const charBeforeCursor = inputValue[cursorPosition - 1]
 					const charAfterCursor = inputValue[cursorPosition + 1]
 
+					// 检查光标前后是否为空白字符
 					const charBeforeIsWhitespace =
 						charBeforeCursor === " " || charBeforeCursor === "\n" || charBeforeCursor === "\r\n"
 					const charAfterIsWhitespace =
 						charAfterCursor === " " || charAfterCursor === "\n" || charAfterCursor === "\r\n"
 
-					// Check if we're right after a space that follows a mention or slash command
+					// 检查是否正好在 @提及 后的空格位置
 					if (
 						charBeforeIsWhitespace &&
 						inputValue.slice(0, cursorPosition - 1).match(new RegExp(mentionRegex.source + "$"))
 					) {
-						// File mention handling
+						// 处理 @提及 - 第一次退格：删除空格并标记
 						const newCursorPosition = cursorPosition - 1
 						if (!charAfterIsWhitespace) {
 							event.preventDefault()
@@ -606,7 +882,7 @@ const ChatTextArea = forwardRef<HTMLTextAreaElement, ChatTextAreaProps>(
 						setJustDeletedSpaceAfterMention(true)
 						setJustDeletedSpaceAfterSlashCommand(false)
 					} else if (charBeforeIsWhitespace && inputValue.slice(0, cursorPosition - 1).match(slashCommandDeleteRegex)) {
-						// New slash command handling
+						// 处理 /命令 - 第一次退格：删除空格并标记
 						const newCursorPosition = cursorPosition - 1
 						if (!charAfterIsWhitespace) {
 							event.preventDefault()
@@ -617,7 +893,7 @@ const ChatTextArea = forwardRef<HTMLTextAreaElement, ChatTextAreaProps>(
 						setJustDeletedSpaceAfterSlashCommand(true)
 						setJustDeletedSpaceAfterMention(false)
 					}
-					// Handle the second backspace press for mentions or slash commands
+					// 第二次退格：删除整个 @提及
 					else if (justDeletedSpaceAfterMention) {
 						const { newText, newPosition } = removeMention(inputValue, cursorPosition)
 						if (newText !== inputValue) {
@@ -627,8 +903,9 @@ const ChatTextArea = forwardRef<HTMLTextAreaElement, ChatTextAreaProps>(
 						}
 						setJustDeletedSpaceAfterMention(false)
 						setShowContextMenu(false)
-					} else if (justDeletedSpaceAfterSlashCommand) {
-						// New slash command deletion
+					}
+					// 第二次退格：删除整个 /命令
+					else if (justDeletedSpaceAfterSlashCommand) {
 						const { newText, newPosition } = removeSlashCommand(inputValue, cursorPosition)
 						if (newText !== inputValue) {
 							event.preventDefault()
@@ -638,7 +915,7 @@ const ChatTextArea = forwardRef<HTMLTextAreaElement, ChatTextAreaProps>(
 						setJustDeletedSpaceAfterSlashCommand(false)
 						setShowSlashCommandsMenu(false)
 					}
-					// Default case - reset flags if none of the above apply
+					// 默认情况 - 重置标记
 					else {
 						setJustDeletedSpaceAfterMention(false)
 						setJustDeletedSpaceAfterSlashCommand(false)
@@ -666,19 +943,31 @@ const ChatTextArea = forwardRef<HTMLTextAreaElement, ChatTextAreaProps>(
 			],
 		)
 
-		// Effect to set cursor position after state updates
+		/**
+		 * 在状态更新后设置光标位置
+		 *
+		 * 由于 React 的状态更新是异步的，我们需要在 DOM 更新后
+		 * 手动设置光标位置到预期位置
+		 */
 		useLayoutEffect(() => {
 			if (intendedCursorPosition !== null && textAreaRef.current) {
 				textAreaRef.current.setSelectionRange(intendedCursorPosition, intendedCursorPosition)
-				setIntendedCursorPosition(null) // Reset the state after applying
+				setIntendedCursorPosition(null) // 应用后重置状态
 			}
 		}, [inputValue, intendedCursorPosition])
 
+		/**
+		 * 处理待插入的文件路径队列
+		 *
+		 * 当用户批量拖放多个文件时，文件路径会被加入队列，
+		 * 然后逐个插入到输入框中
+		 */
 		useEffect(() => {
 			if (pendingInsertions.length === 0 || !textAreaRef.current) {
 				return
 			}
 
+			// 取出队列中的第一个路径
 			const path = pendingInsertions[0]
 			const currentTextArea = textAreaRef.current
 			const currentValue = currentTextArea.value
@@ -686,31 +975,49 @@ const ChatTextArea = forwardRef<HTMLTextAreaElement, ChatTextAreaProps>(
 				intendedCursorPosition ??
 				(currentTextArea.selectionStart >= 0 ? currentTextArea.selectionStart : currentValue.length)
 
+			// 直接插入 @提及
 			const { newValue, mentionIndex } = insertMentionDirectly(currentValue, currentCursorPos, path)
 
 			setInputValue(newValue)
 
+			// 计算新的光标位置（提及末尾 + 空格）
 			const newCursorPosition = mentionIndex + path.length + 2
 			setIntendedCursorPosition(newCursorPosition)
 
+			// 从队列中移除已处理的路径
 			setPendingInsertions((prev) => prev.slice(1))
 		}, [pendingInsertions, setInputValue])
 
+		/** 搜索防抖计时器引用 */
 		const searchTimeoutRef = useRef<NodeJS.Timeout | null>(null)
 
+		/** 当前搜索查询引用 - 用于在异步回调中获取最新值 */
 		const currentSearchQueryRef = useRef<string>("")
 
+		/**
+		 * 处理输入框内容变化
+		 *
+		 * 这是输入框的核心变化处理器，负责：
+		 * - 更新输入值和光标位置
+		 * - 检测是否需要显示 @ 上下文菜单或 / 命令菜单
+		 * - 触发文件搜索（带防抖）
+		 * - 更新搜索查询
+		 *
+		 * @param e - React 变化事件
+		 */
 		const handleInputChange = useCallback(
 			(e: React.ChangeEvent<HTMLTextAreaElement>) => {
 				const newValue = e.target.value
 				const newCursorPosition = e.target.selectionStart
 				setInputValue(newValue)
 				setCursorPosition(newCursorPosition)
+
+				// 检测是否应该显示上下文菜单或斜杠命令菜单
 				let showMenu = shouldShowContextMenu(newValue, newCursorPosition)
 				const showSlashCommandsMenu = shouldShowSlashCommandsMenu(newValue, newCursorPosition)
 
-				// we do not allow both menus to be shown at the same time
-				// the slash commands menu has precedence bc its a narrower component
+				// 不允许同时显示两个菜单
+				// 斜杠命令菜单优先级更高（因为它是更具体的组件）
 				if (showSlashCommandsMenu) {
 					showMenu = false
 				}
@@ -996,8 +1303,17 @@ const ChatTextArea = forwardRef<HTMLTextAreaElement, ChatTextAreaProps>(
 			[updateCursorPosition],
 		)
 
+		/**
+		 * 切换 Plan/Act 模式
+		 *
+		 * Plan 模式：Cline 会收集信息并制定计划，但不会直接执行
+		 * Act 模式：Cline 会直接执行任务
+		 *
+		 * 切换时会将当前输入内容一并发送给后端
+		 */
 		const onModeToggle = useCallback(() => {
 			void (async () => {
+				// 将当前模式取反
 				const convertedProtoMode = mode === "plan" ? PlanActMode.ACT : PlanActMode.PLAN
 				const response = await StateServiceClient.togglePlanActModeProto(
 					TogglePlanActModeRequest.create({
@@ -1009,7 +1325,7 @@ const ChatTextArea = forwardRef<HTMLTextAreaElement, ChatTextAreaProps>(
 						},
 					}),
 				)
-				// Focus the textarea after mode toggle with slight delay
+				// 模式切换后聚焦输入框
 				setTimeout(() => {
 					if (response.value) {
 						setInputValue("")
@@ -1019,7 +1335,8 @@ const ChatTextArea = forwardRef<HTMLTextAreaElement, ChatTextAreaProps>(
 			})()
 		}, [mode, inputValue, selectedImages, selectedFiles, setInputValue])
 
-		useShortcut(usePlatform().togglePlanActKeys, onModeToggle, { disableTextInputs: false }) // important that we don't disable the text input here
+		// 注册 Plan/Act 切换快捷键（重要：不禁用文本输入，允许在输入框中使用）
+		useShortcut(usePlatform().togglePlanActKeys, onModeToggle, { disableTextInputs: false })
 
 		const handleContextButtonClick = useCallback(() => {
 			// Focus the textarea first
@@ -1066,7 +1383,12 @@ const ChatTextArea = forwardRef<HTMLTextAreaElement, ChatTextAreaProps>(
 			navigateToSettingsModelPicker({ targetSection: "api-config" })
 		}
 
-		// Get model display name
+		/**
+		 * 计算当前模型的显示名称
+		 *
+		 * 根据不同的 API 提供商和模型配置，
+		 * 生成格式为 "提供商:模型ID" 的显示字符串
+		 */
 		const modelDisplayName = useMemo(() => {
 			const { selectedProvider, selectedModelId } = normalizeApiConfiguration(apiConfiguration, mode)
 			const {
@@ -1083,6 +1405,8 @@ const ChatTextArea = forwardRef<HTMLTextAreaElement, ChatTextAreaProps>(
 			if (!apiConfiguration) {
 				return unknownModel
 			}
+
+			// 根据不同提供商返回相应的模型名称格式
 			switch (selectedProvider) {
 				case "cline":
 					return `${selectedProvider}:${selectedModelId}`
