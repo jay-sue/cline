@@ -1,96 +1,216 @@
-import { setTimeout as setTimeoutPromise } from "node:timers/promises"
-import { ApiHandler, ApiProviderInfo, buildApiHandler } from "@core/api"
-import { ApiStream } from "@core/api/transform/stream"
-import { AssistantMessageContent, parseAssistantMessageV2, ToolUse } from "@core/assistant-message"
-import { ContextManager } from "@core/context/context-management/ContextManager"
-import { checkContextWindowExceededError } from "@core/context/context-management/context-error-handling"
-import { getContextWindowInfo } from "@core/context/context-management/context-window-utils"
-import { EnvironmentContextTracker } from "@core/context/context-tracking/EnvironmentContextTracker"
-import { FileContextTracker } from "@core/context/context-tracking/FileContextTracker"
-import { ModelContextTracker } from "@core/context/context-tracking/ModelContextTracker"
+/**
+ * ============================================================================
+ * Task 模块 - Cline AI 代理的核心任务执行引擎
+ * ============================================================================
+ *
+ * 该模块是 Cline 扩展的核心，实现了 AI 代理的完整任务执行生命周期。
+ * Task 类管理与 AI 模型的对话循环、工具执行、状态管理和用户交互。
+ *
+ * 主要职责：
+ * - 任务生命周期管理（启动、恢复、暂停、取消）
+ * - AI API 请求和响应流处理
+ * - 工具调用解析和执行
+ * - 消息状态管理和持久化
+ * - 与 Webview UI 的双向通信
+ * - 检查点管理（支持任务回滚）
+ * - 钩子系统集成（任务前/后钩子）
+ * - 上下文管理和压缩
+ *
+ * 核心概念：
+ * - Task: 代表一次完整的 AI 对话会话
+ * - API Conversation History: 发送给 AI 的对话历史
+ * - Cline Messages: 显示在 UI 中的消息
+ * - Tool Execution: AI 请求的工具操作
+ * - Checkpoint: 任务状态快照，支持回滚
+ *
+ * 执行流程：
+ * 1. 用户提交任务 → startTask()
+ * 2. 构建系统提示词 → getSystemPrompt()
+ * 3. 发送 API 请求 → recursivelyMakeClineRequests()
+ * 4. 解析响应 → parseAssistantMessageV2()
+ * 5. 执行工具 → ToolExecutor.execute()
+ * 6. 收集反馈 → ask() / say()
+ * 7. 循环直到完成或取消
+ *
+ * ============================================================================
+ */
+
+// ============================================================================
+// Node.js 内置模块
+// ============================================================================
+import { setTimeout as setTimeoutPromise } from "node:timers/promises" // Promise 版本的 setTimeout
+
+// ============================================================================
+// 核心 API 模块
+// ============================================================================
+import { ApiHandler, ApiProviderInfo, buildApiHandler } from "@core/api" // API 处理器和构建器
+import { ApiStream } from "@core/api/transform/stream" // API 响应流处理
+
+// ============================================================================
+// 助手消息解析
+// ============================================================================
+import { AssistantMessageContent, parseAssistantMessageV2, ToolUse } from "@core/assistant-message" // AI 响应解析
+
+// ============================================================================
+// 上下文管理模块
+// ============================================================================
+import { ContextManager } from "@core/context/context-management/ContextManager" // 上下文管理器
+import { checkContextWindowExceededError } from "@core/context/context-management/context-error-handling" // 上下文窗口超限检查
+import { getContextWindowInfo } from "@core/context/context-management/context-window-utils" // 上下文窗口信息
+import { EnvironmentContextTracker } from "@core/context/context-tracking/EnvironmentContextTracker" // 环境上下文追踪
+import { FileContextTracker } from "@core/context/context-tracking/FileContextTracker" // 文件上下文追踪
+import { ModelContextTracker } from "@core/context/context-tracking/ModelContextTracker" // 模型上下文追踪
+
+// ============================================================================
+// 规则和指令模块
+// ============================================================================
 import {
 	getGlobalClineRules,
 	getLocalClineRules,
 	refreshClineRulesToggles,
-} from "@core/context/instructions/user-instructions/cline-rules"
+} from "@core/context/instructions/user-instructions/cline-rules" // Cline 规则管理
 import {
 	getLocalAgentsRules,
 	getLocalCursorRules,
 	getLocalWindsurfRules,
 	refreshExternalRulesToggles,
-} from "@core/context/instructions/user-instructions/external-rules"
-import { sendPartialMessageEvent } from "@core/controller/ui/subscribeToPartialMessage"
-import { getHooksEnabledSafe } from "@core/hooks/hooks-utils"
-import { executePreCompactHookWithCleanup, HookCancellationError, HookExecution } from "@core/hooks/precompact-executor"
-import { ClineIgnoreController } from "@core/ignore/ClineIgnoreController"
-import { parseMentions } from "@core/mentions"
-import { CommandPermissionController } from "@core/permissions"
-import { summarizeTask } from "@core/prompts/contextManagement"
-import { formatResponse } from "@core/prompts/responses"
-import { parseSlashCommands } from "@core/slash-commands"
+} from "@core/context/instructions/user-instructions/external-rules" // 外部规则集成
+
+// ============================================================================
+// 控制器通信
+// ============================================================================
+import { sendPartialMessageEvent } from "@core/controller/ui/subscribeToPartialMessage" // 部分消息事件发送
+
+// ============================================================================
+// 钩子系统
+// ============================================================================
+import { getHooksEnabledSafe } from "@core/hooks/hooks-utils" // 钩子启用状态检查
+import { executePreCompactHookWithCleanup, HookCancellationError, HookExecution } from "@core/hooks/precompact-executor" // 预压缩钩子执行
+
+// ============================================================================
+// 忽略和权限控制
+// ============================================================================
+import { ClineIgnoreController } from "@core/ignore/ClineIgnoreController" // .clineignore 文件控制
+import { CommandPermissionController } from "@core/permissions" // 命令权限控制
+
+// ============================================================================
+// 提示词和响应格式化
+// ============================================================================
+import { parseMentions } from "@core/mentions" // @mentions 解析
+import { summarizeTask } from "@core/prompts/contextManagement" // 任务摘要生成
+import { formatResponse } from "@core/prompts/responses" // 响应格式化
+import { parseSlashCommands } from "@core/slash-commands" // 斜杠命令解析
+
+// ============================================================================
+// 存储模块
+// ============================================================================
 import {
 	ensureRulesDirectoryExists,
 	ensureTaskDirectoryExists,
 	GlobalFileNames,
 	getSavedApiConversationHistory,
 	getSavedClineMessages,
-} from "@core/storage/disk"
-import { releaseTaskLock } from "@core/task/TaskLockUtils"
-import { isMultiRootEnabled } from "@core/workspace/multi-root-utils"
-import { WorkspaceRootManager } from "@core/workspace/WorkspaceRootManager"
-import { buildCheckpointManager, shouldUseMultiRoot } from "@integrations/checkpoints/factory"
-import { ensureCheckpointInitialized } from "@integrations/checkpoints/initializer"
-import { ICheckpointManager } from "@integrations/checkpoints/types"
-import { DiffViewProvider } from "@integrations/editor/DiffViewProvider"
-import { formatContentBlockToMarkdown } from "@integrations/misc/export-markdown"
-import { processFilesIntoText } from "@integrations/misc/extract-text"
-import { showSystemNotification } from "@integrations/notifications"
-import { ITerminalManager } from "@integrations/terminal/types"
-import { BrowserSession } from "@services/browser/BrowserSession"
-import { UrlContentFetcher } from "@services/browser/UrlContentFetcher"
-import { featureFlagsService } from "@services/feature-flags"
-import { listFiles } from "@services/glob/list-files"
-import { McpHub } from "@services/mcp/McpHub"
-import { ApiConfiguration } from "@shared/api"
-import { findLast, findLastIndex } from "@shared/array"
-import { combineApiRequests } from "@shared/combineApiRequests"
-import { combineCommandSequences } from "@shared/combineCommandSequences"
-import { ClineApiReqCancelReason, ClineApiReqInfo, ClineAsk, ClineMessage, ClineSay } from "@shared/ExtensionMessage"
-import { HistoryItem } from "@shared/HistoryItem"
-import { DEFAULT_LANGUAGE_SETTINGS, getLanguageKey, LanguageDisplay } from "@shared/Languages"
-import { USER_CONTENT_TAGS } from "@shared/messages/constants"
-import { convertClineMessageToProto } from "@shared/proto-conversions/cline-message"
-import { ClineDefaultTool, READ_ONLY_TOOLS } from "@shared/tools"
-import { ClineAskResponse } from "@shared/WebviewMessage"
+} from "@core/storage/disk" // 磁盘存储操作
+
+// ============================================================================
+// 任务锁定
+// ============================================================================
+import { releaseTaskLock } from "@core/task/TaskLockUtils" // 任务锁释放
+
+// ============================================================================
+// 工作区管理
+// ============================================================================
+import { isMultiRootEnabled } from "@core/workspace/multi-root-utils" // 多根工作区检测
+import { WorkspaceRootManager } from "@core/workspace/WorkspaceRootManager" // 工作区根管理器
+
+// ============================================================================
+// 检查点管理
+// ============================================================================
+import { buildCheckpointManager, shouldUseMultiRoot } from "@integrations/checkpoints/factory" // 检查点管理器工厂
+import { ensureCheckpointInitialized } from "@integrations/checkpoints/initializer" // 检查点初始化
+import { ICheckpointManager } from "@integrations/checkpoints/types" // 检查点管理器接口
+
+// ============================================================================
+// 编辑器集成
+// ============================================================================
+import { DiffViewProvider } from "@integrations/editor/DiffViewProvider" // 差异视图提供者
+
+// ============================================================================
+// 其他集成
+// ============================================================================
+import { formatContentBlockToMarkdown } from "@integrations/misc/export-markdown" // Markdown 导出
+import { processFilesIntoText } from "@integrations/misc/extract-text" // 文件内容提取
+import { showSystemNotification } from "@integrations/notifications" // 系统通知
+import { ITerminalManager } from "@integrations/terminal/types" // 终端管理器接口
+
+// ============================================================================
+// 服务层
+// ============================================================================
+import { BrowserSession } from "@services/browser/BrowserSession" // 浏览器会话管理
+import { UrlContentFetcher } from "@services/browser/UrlContentFetcher" // URL 内容获取
+import { featureFlagsService } from "@services/feature-flags" // 功能标志服务
+import { listFiles } from "@services/glob/list-files" // 文件列表服务
+import { McpHub } from "@services/mcp/McpHub" // MCP 服务器中心
+
+// ============================================================================
+// 共享类型和工具
+// ============================================================================
+import { ApiConfiguration } from "@shared/api" // API 配置类型
+import { findLast, findLastIndex } from "@shared/array" // 数组工具函数
+import { combineApiRequests } from "@shared/combineApiRequests" // API 请求合并
+import { combineCommandSequences } from "@shared/combineCommandSequences" // 命令序列合并
+import { ClineApiReqCancelReason, ClineApiReqInfo, ClineAsk, ClineMessage, ClineSay } from "@shared/ExtensionMessage" // 消息类型
+import { HistoryItem } from "@shared/HistoryItem" // 历史记录项类型
+import { DEFAULT_LANGUAGE_SETTINGS, getLanguageKey, LanguageDisplay } from "@shared/Languages" // 语言设置
+import { USER_CONTENT_TAGS } from "@shared/messages/constants" // 用户内容标签
+import { convertClineMessageToProto } from "@shared/proto-conversions/cline-message" // Proto 消息转换
+import { ClineDefaultTool, READ_ONLY_TOOLS } from "@shared/tools" // 工具定义
+import { ClineAskResponse } from "@shared/WebviewMessage" // Webview 响应类型
+
+// ============================================================================
+// 模型工具函数
+// ============================================================================
 import {
 	isClaude4PlusModelFamily,
 	isGPT5ModelFamily,
 	isLocalModel,
 	isNextGenModelFamily,
 	isParallelToolCallingEnabled,
-} from "@utils/model-utils"
-import { arePathsEqual, getDesktopDir } from "@utils/path"
-import { filterExistingFiles } from "@utils/tabFiltering"
-import cloneDeep from "clone-deep"
-import fs from "fs/promises"
-import Mutex from "p-mutex"
-import pWaitFor from "p-wait-for"
-import * as path from "path"
-import { ulid } from "ulid"
-import type { SystemPromptContext } from "@/core/prompts/system-prompt"
-import { getSystemPrompt } from "@/core/prompts/system-prompt"
-import { HostProvider } from "@/hosts/host-provider"
-import { FileEditProvider } from "@/integrations/editor/FileEditProvider"
+} from "@utils/model-utils" // 模型检测工具
+import { arePathsEqual, getDesktopDir } from "@utils/path" // 路径工具
+import { filterExistingFiles } from "@utils/tabFiltering" // 标签页文件过滤
+
+// ============================================================================
+// 第三方库
+// ============================================================================
+import cloneDeep from "clone-deep" // 深拷贝
+import fs from "fs/promises" // 文件系统异步操作
+import Mutex from "p-mutex" // 互斥锁
+import pWaitFor from "p-wait-for" // Promise 等待工具
+import * as path from "path" // 路径处理
+import { ulid } from "ulid" // ULID 生成器
+
+// ============================================================================
+// 内部模块
+// ============================================================================
+import type { SystemPromptContext } from "@/core/prompts/system-prompt" // 系统提示词上下文类型
+import { getSystemPrompt } from "@/core/prompts/system-prompt" // 系统提示词生成
+import { HostProvider } from "@/hosts/host-provider" // 宿主提供者
+import { FileEditProvider } from "@/integrations/editor/FileEditProvider" // 文件编辑提供者
 import {
 	type CommandExecutionOptions,
 	CommandExecutor,
 	CommandExecutorCallbacks,
 	FullCommandExecutorConfig,
 	StandaloneTerminalManager,
-} from "@/integrations/terminal"
-import { ClineError, ClineErrorType, ErrorService } from "@/services/error"
-import { telemetryService } from "@/services/telemetry"
-import { ClineClient } from "@/shared/cline"
+} from "@/integrations/terminal" // 终端和命令执行
+import { ClineError, ClineErrorType, ErrorService } from "@/services/error" // 错误服务
+import { telemetryService } from "@/services/telemetry" // 遥测服务
+import { ClineClient } from "@/shared/cline" // Cline 客户端
+
+// ============================================================================
+// 消息类型定义
+// ============================================================================
 import {
 	ClineAssistantContent,
 	ClineContent,
@@ -100,76 +220,193 @@ import {
 	ClineTextContentBlock,
 	ClineToolResponseContent,
 	ClineUserContent,
-} from "@/shared/messages"
-import { ApiFormat } from "@/shared/proto/cline/models"
-import { ShowMessageType } from "@/shared/proto/index.host"
-import { Logger } from "@/shared/services/Logger"
-import { Session } from "@/shared/services/Session"
-import { RuleContextBuilder } from "../context/instructions/user-instructions/RuleContextBuilder"
-import { ensureLocalClineDirExists } from "../context/instructions/user-instructions/rule-helpers"
-import { discoverSkills, getAvailableSkills } from "../context/instructions/user-instructions/skills"
-import { refreshWorkflowToggles } from "../context/instructions/user-instructions/workflows"
-import { Controller } from "../controller"
-import { executeHook } from "../hooks/hook-executor"
-import { StateManager } from "../storage/StateManager"
-import { FocusChainManager } from "./focus-chain"
-import { MessageStateHandler } from "./message-state"
-import { StreamResponseHandler } from "./StreamResponseHandler"
-import { TaskState } from "./TaskState"
-import { ToolExecutor } from "./ToolExecutor"
-import { detectAvailableCliTools, extractProviderDomainFromUrl, updateApiReqMsg } from "./utils"
-import { buildUserFeedbackContent } from "./utils/buildUserFeedbackContent"
+} from "@/shared/messages" // 各种消息内容类型
+import { ApiFormat } from "@/shared/proto/cline/models" // API 格式枚举
+import { ShowMessageType } from "@/shared/proto/index.host" // 消息显示类型
+import { Logger } from "@/shared/services/Logger" // 日志服务
+import { Session } from "@/shared/services/Session" // 会话服务
 
+// ============================================================================
+// 本地模块
+// ============================================================================
+import { RuleContextBuilder } from "../context/instructions/user-instructions/RuleContextBuilder" // 规则上下文构建器
+import { ensureLocalClineDirExists } from "../context/instructions/user-instructions/rule-helpers" // 规则目录辅助函数
+import { discoverSkills, getAvailableSkills } from "../context/instructions/user-instructions/skills" // 技能发现和获取
+import { refreshWorkflowToggles } from "../context/instructions/user-instructions/workflows" // 工作流开关刷新
+import { Controller } from "../controller" // 控制器
+import { executeHook } from "../hooks/hook-executor" // 钩子执行器
+import { StateManager } from "../storage/StateManager" // 状态管理器
+import { FocusChainManager } from "./focus-chain" // 焦点链管理器
+import { MessageStateHandler } from "./message-state" // 消息状态处理器
+import { StreamResponseHandler } from "./StreamResponseHandler" // 流响应处理器
+import { TaskState } from "./TaskState" // 任务状态类
+import { ToolExecutor } from "./ToolExecutor" // 工具执行器
+import { detectAvailableCliTools, extractProviderDomainFromUrl, updateApiReqMsg } from "./utils" // 工具函数
+import { buildUserFeedbackContent } from "./utils/buildUserFeedbackContent" // 用户反馈内容构建
+
+// ============================================================================
+// 类型导出
+// ============================================================================
+
+/**
+ * 工具响应类型别名
+ * 表示工具执行后返回给 AI 的响应内容
+ */
 export type ToolResponse = ClineToolResponseContent
 
+/**
+ * Task 构造函数参数类型
+ *
+ * 定义创建 Task 实例所需的所有参数，包括：
+ * - 核心依赖（控制器、MCP 服务器中心）
+ * - 回调函数（历史更新、状态通知等）
+ * - 终端配置（超时、复用、输出限制等）
+ * - 工作区信息
+ * - 任务数据（提示词、图片、文件或历史记录）
+ */
 type TaskParams = {
+	/** 主控制器实例，用于协调扩展各组件 */
 	controller: Controller
+	/** MCP 服务器中心，管理 MCP 服务器连接 */
 	mcpHub: McpHub
+	/** 任务历史更新回调 */
 	updateTaskHistory: (historyItem: HistoryItem) => Promise<HistoryItem[]>
+	/** 状态更新到 Webview 的回调 */
 	postStateToWebview: () => Promise<void>
+	/** 从任务 ID 重新初始化任务的回调 */
 	reinitExistingTaskFromId: (taskId: string) => Promise<void>
+	/** 取消任务的回调 */
 	cancelTask: () => Promise<void>
+	/** Shell 集成超时时间（毫秒） */
 	shellIntegrationTimeout: number
+	/** 是否启用终端复用 */
 	terminalReuseEnabled: boolean
+	/** 终端输出行数限制 */
 	terminalOutputLineLimit: number
+	/** 默认终端配置文件 */
 	defaultTerminalProfile: string
+	/** VSCode 终端执行模式：vscodeTerminal（可见）或 backgroundExec（后台） */
 	vscodeTerminalExecutionMode: "vscodeTerminal" | "backgroundExec"
+	/** 当前工作目录 */
 	cwd: string
+	/** 状态管理器实例 */
 	stateManager: StateManager
+	/** 工作区管理器（可选） */
 	workspaceManager?: WorkspaceRootManager
+	/** 任务描述文本（新任务时提供） */
 	task?: string
+	/** 附加图片路径数组（新任务时提供） */
 	images?: string[]
+	/** 附加文件路径数组（新任务时提供） */
 	files?: string[]
+	/** 历史记录项（恢复任务时提供） */
 	historyItem?: HistoryItem
+	/** 任务唯一标识符 */
 	taskId: string
+	/** 是否已获取任务锁 */
 	taskLockAcquired: boolean
 }
 
+/**
+ * Task 类 - Cline AI 代理的核心任务执行引擎
+ *
+ * 该类是 Cline 扩展最核心的组件，负责管理 AI 代理的完整执行生命周期。
+ * 它协调 API 调用、工具执行、消息管理和用户交互。
+ *
+ * 主要功能：
+ * - 任务启动和恢复
+ * - AI API 请求管理
+ * - 工具调用解析和执行
+ * - 消息状态管理
+ * - 检查点创建和回滚
+ * - 钩子系统集成
+ * - 上下文压缩和管理
+ *
+ * 线程安全：
+ * - 使用 Mutex 保护所有状态修改
+ * - 防止 TOCTOU（Time-of-Check-Time-of-Use）竞态条件
+ *
+ * 生命周期：
+ * - 由 Controller.initTask() 创建
+ * - 通过 startTask() 或 resumeTaskFromHistory() 启动
+ * - 通过 abortTask() 终止
+ * - 任务完成后由 Controller 清理
+ */
 export class Task {
-	// Core task variables
+	// ========================================================================
+	// 核心任务变量
+	// ========================================================================
+
+	/**
+	 * 任务唯一标识符
+	 * 通常是时间戳，用于关联任务文件和历史记录
+	 */
 	readonly taskId: string
+
+	/**
+	 * ULID (Universally Unique Lexicographically Sortable Identifier)
+	 * 用于遥测和日志追踪，按时间排序的唯一标识
+	 */
 	readonly ulid: string
+
+	/**
+	 * 任务是否被收藏
+	 * 收藏的任务会在历史列表中置顶显示
+	 */
 	private taskIsFavorited?: boolean
+
+	/**
+	 * 当前工作目录
+	 * 所有相对路径都基于此目录解析
+	 */
 	private cwd: string
+
+	/**
+	 * 任务初始化开始时间
+	 * 用于性能监控和遥测
+	 */
 	private taskInitializationStartTime: number
 
+	/**
+	 * 任务状态对象
+	 * 包含所有运行时状态（流式传输、中止、错误等）
+	 */
 	taskState: TaskState
 
-	// ONE mutex for ALL state modifications to prevent race conditions
+	// ========================================================================
+	// 并发控制
+	// ========================================================================
+
+	/**
+	 * 状态修改互斥锁
+	 * 所有状态修改都必须通过此锁，防止竞态条件
+	 */
 	private stateMutex = new Mutex()
 
 	/**
-	 * Execute function with exclusive lock on all task state
-	 * Use this for ANY state modification to prevent races
+	 * 使用独占锁执行函数
+	 *
+	 * 任何状态修改都应使用此方法，确保线程安全。
+	 * 防止多个异步操作同时修改状态导致的竞态条件。
+	 *
+	 * @param fn - 要执行的函数
+	 * @returns 函数执行结果
 	 */
 	private async withStateLock<T>(fn: () => T | Promise<T>): Promise<T> {
 		return await this.stateMutex.withLock(fn)
 	}
 
+	// ========================================================================
+	// 钩子执行状态管理（原子操作）
+	// ========================================================================
+
 	/**
-	 * Atomically set active hook execution with mutex protection
-	 * Prevents TOCTOU races when setting hook execution state
-	 * PUBLIC: Exposed for ToolExecutor to use
+	 * 原子设置活动钩子执行状态
+	 *
+	 * 使用互斥锁保护，防止设置钩子执行状态时的 TOCTOU 竞态条件。
+	 * 公开给 ToolExecutor 使用。
+	 *
+	 * @param hookExecution - 钩子执行信息
 	 */
 	public async setActiveHookExecution(hookExecution: NonNullable<typeof this.taskState.activeHookExecution>): Promise<void> {
 		await this.withStateLock(() => {
@@ -178,9 +415,10 @@ export class Task {
 	}
 
 	/**
-	 * Atomically clear active hook execution with mutex protection
-	 * Prevents TOCTOU races when clearing hook execution state
-	 * PUBLIC: Exposed for ToolExecutor to use
+	 * 原子清除活动钩子执行状态
+	 *
+	 * 使用互斥锁保护，防止清除钩子执行状态时的 TOCTOU 竞态条件。
+	 * 公开给 ToolExecutor 使用。
 	 */
 	public async clearActiveHookExecution(): Promise<void> {
 		await this.withStateLock(() => {
@@ -189,9 +427,12 @@ export class Task {
 	}
 
 	/**
-	 * Atomically read active hook execution state with mutex protection
-	 * Returns a snapshot of the current state to prevent TOCTOU races
-	 * PUBLIC: Exposed for ToolExecutor to use
+	 * 原子读取活动钩子执行状态
+	 *
+	 * 使用互斥锁保护，返回当前状态的快照以防止 TOCTOU 竞态条件。
+	 * 公开给 ToolExecutor 使用。
+	 *
+	 * @returns 当前钩子执行状态的快照
 	 */
 	public async getActiveHookExecution(): Promise<typeof this.taskState.activeHookExecution> {
 		return await this.withStateLock(() => {
@@ -199,63 +440,244 @@ export class Task {
 		})
 	}
 
-	// Core dependencies
+	// ========================================================================
+	// 核心依赖
+	// ========================================================================
+
+	/**
+	 * 主控制器引用
+	 * 用于访问全局服务和协调扩展组件
+	 */
 	private controller: Controller
+
+	/**
+	 * MCP 服务器中心
+	 * 管理所有 MCP (Model Context Protocol) 服务器连接
+	 */
 	private mcpHub: McpHub
 
-	// Service handlers
-	api: ApiHandler
-	terminalManager: ITerminalManager
-	private urlContentFetcher: UrlContentFetcher
-	browserSession: BrowserSession
-	contextManager: ContextManager
-	private diffViewProvider: DiffViewProvider
-	public checkpointManager?: ICheckpointManager
-	private initialCheckpointCommitPromise?: Promise<string | undefined>
-	private clineIgnoreController: ClineIgnoreController
-	private commandPermissionController: CommandPermissionController
-	private toolExecutor: ToolExecutor
+	// ========================================================================
+	// 服务处理器
+	// ========================================================================
+
 	/**
-	 * Whether the task is using native tool calls.
-	 * This is used to determine how we would format response.
-	 * Example: We don't add noToolsUsed response when native tool call is used
-	 * because of the expected format from the tool calls is different.
+	 * API 处理器
+	 * 负责与 AI 模型 API 的通信（OpenRouter、Anthropic、OpenAI 等）
+	 */
+	api: ApiHandler
+
+	/**
+	 * 终端管理器
+	 * 管理命令执行的终端实例
+	 */
+	terminalManager: ITerminalManager
+
+	/**
+	 * URL 内容获取器
+	 * 用于获取网页内容
+	 */
+	private urlContentFetcher: UrlContentFetcher
+
+	/**
+	 * 浏览器会话
+	 * 管理浏览器自动化操作（截图、导航等）
+	 */
+	browserSession: BrowserSession
+
+	/**
+	 * 上下文管理器
+	 * 管理对话上下文的压缩和截断
+	 */
+	contextManager: ContextManager
+
+	/**
+	 * 差异视图提供者
+	 * 显示文件编辑的差异对比
+	 */
+	private diffViewProvider: DiffViewProvider
+
+	/**
+	 * 检查点管理器
+	 * 创建和恢复任务状态快照
+	 */
+	public checkpointManager?: ICheckpointManager
+
+	/**
+	 * 初始检查点提交 Promise
+	 * 用于等待初始检查点创建完成
+	 */
+	private initialCheckpointCommitPromise?: Promise<string | undefined>
+
+	/**
+	 * Cline 忽略控制器
+	 * 处理 .clineignore 文件规则
+	 */
+	private clineIgnoreController: ClineIgnoreController
+
+	/**
+	 * 命令权限控制器
+	 * 管理命令执行的权限检查
+	 */
+	private commandPermissionController: CommandPermissionController
+
+	/**
+	 * 工具执行器
+	 * 执行 AI 请求的各种工具操作
+	 */
+	private toolExecutor: ToolExecutor
+
+	/**
+	 * 是否使用原生工具调用
+	 *
+	 * 用于确定如何格式化响应。
+	 * 例如：使用原生工具调用时不添加 noToolsUsed 响应，
+	 * 因为工具调用的预期格式不同。
 	 */
 	private useNativeToolCalls = false
+
+	/**
+	 * 流响应处理器
+	 * 处理 AI API 的流式响应
+	 */
 	private streamHandler: StreamResponseHandler
 
+	/**
+	 * 终端执行模式
+	 * - vscodeTerminal: 使用可见的 VSCode 终端
+	 * - backgroundExec: 在后台执行命令
+	 */
 	private terminalExecutionMode: "vscodeTerminal" | "backgroundExec"
 
-	// Metadata tracking
+	// ========================================================================
+	// 元数据追踪器
+	// ========================================================================
+
+	/**
+	 * 文件上下文追踪器
+	 * 追踪任务中访问和修改的文件
+	 */
 	private fileContextTracker: FileContextTracker
+
+	/**
+	 * 模型上下文追踪器
+	 * 追踪使用的模型和 token 消耗
+	 */
 	private modelContextTracker: ModelContextTracker
+
+	/**
+	 * 环境上下文追踪器
+	 * 记录运行环境信息（OS、工作区等）
+	 */
 	private environmentContextTracker: EnvironmentContextTracker
 
-	// Focus Chain
+	// ========================================================================
+	// 焦点链管理
+	// ========================================================================
+
+	/**
+	 * 焦点链管理器
+	 * 管理任务的焦点和进度追踪（可选功能）
+	 */
 	private FocusChainManager?: FocusChainManager
 
-	// Callbacks
+	// ========================================================================
+	// 回调函数
+	// ========================================================================
+
+	/**
+	 * 任务历史更新回调
+	 * 将任务信息保存到历史记录
+	 */
 	private updateTaskHistory: (historyItem: HistoryItem) => Promise<HistoryItem[]>
+
+	/**
+	 * 状态推送到 Webview 的回调
+	 * 通知 UI 更新显示
+	 */
 	private postStateToWebview: () => Promise<void>
+
+	/**
+	 * 从任务 ID 重新初始化任务的回调
+	 * 用于任务切换
+	 */
 	private reinitExistingTaskFromId: (taskId: string) => Promise<void>
+
+	/**
+	 * 取消任务的回调
+	 * 通知控制器执行取消流程
+	 */
 	private cancelTask: () => Promise<void>
 
-	// Cache service
+	// ========================================================================
+	// 状态管理
+	// ========================================================================
+
+	/**
+	 * 状态管理器
+	 * 管理全局状态、工作区状态和任务设置
+	 */
 	private stateManager: StateManager
 
-	// Message and conversation state
+	/**
+	 * 消息状态处理器
+	 * 管理 Cline 消息和 API 对话历史
+	 */
 	messageStateHandler: MessageStateHandler
 
-	// Workspace manager
+	// ========================================================================
+	// 工作区管理
+	// ========================================================================
+
+	/**
+	 * 工作区管理器
+	 * 管理多根工作区的检测和操作
+	 */
 	workspaceManager?: WorkspaceRootManager
 
-	// Task Locking (Sqlite)
+	// ========================================================================
+	// 任务锁定
+	// ========================================================================
+
+	/**
+	 * 任务锁获取状态
+	 * 标识是否成功获取了任务锁（SQLite 实现）
+	 */
 	private taskLockAcquired: boolean
 
-	// Command executor for running shell commands (extracted from executeCommandTool)
+	// ========================================================================
+	// 命令执行
+	// ========================================================================
+
+	/**
+	 * 命令执行器
+	 * 运行 shell 命令，从 executeCommandTool 提取
+	 */
 	private commandExecutor!: CommandExecutor
 
+	// ========================================================================
+	// 构造函数
+	// ========================================================================
+
+	/**
+	 * 创建 Task 实例
+	 *
+	 * 初始化任务的所有组件和服务，包括：
+	 * 1. 核心状态和依赖注入
+	 * 2. 终端管理器配置
+	 * 3. 浏览器和 URL 服务
+	 * 4. 上下文追踪器
+	 * 5. 检查点管理器
+	 * 6. API 处理器
+	 * 7. 命令执行器
+	 * 8. 工具执行器
+	 *
+	 * 注意：任务启动（startTask/resumeTaskFromHistory）在构造后
+	 * 由 Controller.initTask() 调用，防止竞态条件。
+	 *
+	 * @param params - 任务参数对象
+	 */
 	constructor(params: TaskParams) {
+		// 解构参数
 		const {
 			controller,
 			mcpHub,
@@ -279,6 +701,9 @@ export class Task {
 			taskLockAcquired,
 		} = params
 
+		// ====================================================================
+		// 核心状态初始化
+		// ====================================================================
 		this.taskInitializationStartTime = performance.now()
 		this.taskState = new TaskState()
 		this.controller = controller
@@ -290,25 +715,32 @@ export class Task {
 		this.clineIgnoreController = new ClineIgnoreController(cwd)
 		this.commandPermissionController = new CommandPermissionController()
 		this.taskLockAcquired = taskLockAcquired
-		// Determine terminal execution mode and create appropriate terminal manager
+
+		// ====================================================================
+		// 终端管理器配置
+		// ====================================================================
+		// 确定终端执行模式并创建相应的终端管理器
 		this.terminalExecutionMode = vscodeTerminalExecutionMode || "vscodeTerminal"
 
-		// When backgroundExec mode is selected, use StandaloneTerminalManager for hidden execution
-		// Otherwise, use the HostProvider's terminal manager (VSCode terminal in VSCode, standalone in CLI)
+		// 选择 backgroundExec 模式时，使用 StandaloneTerminalManager 进行隐藏执行
+		// 否则，使用 HostProvider 的终端管理器（VSCode 环境中使用 VSCode 终端，CLI 中使用独立终端）
 		if (this.terminalExecutionMode === "backgroundExec") {
-			// Import StandaloneTerminalManager for background execution
 			this.terminalManager = new StandaloneTerminalManager()
 			Logger.info(`[Task ${taskId}] Using StandaloneTerminalManager for backgroundExec mode`)
 		} else {
-			// Use the host-provided terminal manager (VSCode terminal in VSCode environment)
 			this.terminalManager = HostProvider.get().createTerminalManager()
 			Logger.info(`[Task ${taskId}] Using HostProvider terminal manager for vscodeTerminal mode`)
 		}
+
+		// 配置终端管理器参数
 		this.terminalManager.setShellIntegrationTimeout(shellIntegrationTimeout)
 		this.terminalManager.setTerminalReuseEnabled(terminalReuseEnabled ?? true)
 		this.terminalManager.setTerminalOutputLineLimit(terminalOutputLineLimit)
 		this.terminalManager.setDefaultTerminalProfile(defaultTerminalProfile)
 
+		// ====================================================================
+		// 服务初始化
+		// ====================================================================
 		this.urlContentFetcher = new UrlContentFetcher()
 		this.browserSession = new BrowserSession(stateManager)
 		this.contextManager = new ContextManager()
@@ -317,21 +749,31 @@ export class Task {
 		this.stateManager = stateManager
 		this.workspaceManager = workspaceManager
 
-		// DiffViewProvider opens Diff Editor during edits while FileEditProvider performs
-		// edits in the background without stealing user's editor's focus.
+		// ====================================================================
+		// 差异视图配置
+		// ====================================================================
+		// DiffViewProvider 在编辑时打开差异编辑器
+		// FileEditProvider 在后台执行编辑，不抢占用户编辑器焦点
 		const backgroundEditEnabled = this.stateManager.getGlobalSettingsKey("backgroundEditEnabled")
 		this.diffViewProvider = backgroundEditEnabled ? new FileEditProvider() : HostProvider.get().createDiffViewProvider()
 
-		// Set up MCP notification callback for real-time notifications
+		// ====================================================================
+		// MCP 通知回调设置
+		// ====================================================================
+		// 设置实时通知回调，在聊天中立即显示 MCP 服务器通知
 		this.mcpHub.setNotificationCallback(async (serverName: string, _level: string, message: string) => {
-			// Display notification in chat immediately
 			await this.say("mcp_notification", `[${serverName}] ${message}`)
 		})
 
+		// ====================================================================
+		// 任务 ID 和 ULID 初始化
+		// ====================================================================
 		this.taskId = taskId
 
-		// Initialize taskId first
+		// 首先初始化 taskId
+		// 根据是恢复任务还是新任务，设置 ULID 和相关状态
 		if (historyItem) {
+			// 从历史记录恢复任务
 			this.ulid = historyItem.ulid ?? ulid()
 			this.taskIsFavorited = historyItem.isFavorited
 			this.taskState.conversationHistoryDeletedRange = historyItem.conversationHistoryDeletedRange
@@ -339,11 +781,15 @@ export class Task {
 				this.taskState.checkpointManagerErrorMessage = historyItem.checkpointManagerErrorMessage
 			}
 		} else if (task || images || files) {
+			// 新任务
 			this.ulid = ulid()
 		} else {
 			throw new Error("Either historyItem or task/images must be provided")
 		}
 
+		// ====================================================================
+		// 消息状态处理器初始化
+		// ====================================================================
 		this.messageStateHandler = new MessageStateHandler({
 			taskId: this.taskId,
 			ulid: this.ulid,
@@ -352,12 +798,16 @@ export class Task {
 			updateTaskHistory: this.updateTaskHistory,
 		})
 
-		// Initialize context trackers
+		// ====================================================================
+		// 上下文追踪器初始化
+		// ====================================================================
 		this.fileContextTracker = new FileContextTracker(controller, this.taskId)
 		this.modelContextTracker = new ModelContextTracker(this.taskId)
 		this.environmentContextTracker = new EnvironmentContextTracker(this.taskId)
 
-		// Initialize focus chain manager only if enabled
+		// ====================================================================
+		// 焦点链管理器初始化（仅当启用时）
+		// ====================================================================
 		const focusChainSettings = this.stateManager.getGlobalSettingsKey("focusChainSettings")
 		if (focusChainSettings.enabled) {
 			this.FocusChainManager = new FocusChainManager({
@@ -371,16 +821,19 @@ export class Task {
 			})
 		}
 
-		// Check for multiroot workspace and warn about checkpoints
+		// ====================================================================
+		// 检查点管理器初始化
+		// ====================================================================
+		// 检查多根工作区并警告检查点限制
 		const isMultiRootWorkspace = this.workspaceManager && this.workspaceManager.getRoots().length > 1
 		const checkpointsEnabled = this.stateManager.getGlobalSettingsKey("enableCheckpointsSetting")
 
 		if (isMultiRootWorkspace && checkpointsEnabled) {
-			// Set checkpoint manager error message to display warning in TaskHeader
+			// 设置检查点管理器错误消息，在 TaskHeader 中显示警告
 			this.taskState.checkpointManagerErrorMessage = "Checkpoints are not currently supported in multi-root workspaces."
 		}
 
-		// Initialize checkpoint manager based on workspace configuration
+		// 根据工作区配置初始化检查点管理器
 		if (!isMultiRootWorkspace) {
 			try {
 				this.checkpointManager = buildCheckpointManager({
@@ -399,8 +852,8 @@ export class Task {
 					stateManager: this.stateManager,
 				})
 
-				// If multi-root, kick off non-blocking initialization
-				// Unreachable for now, leaving in for future multi-root checkpoint support
+				// 如果是多根工作区，启动非阻塞初始化
+				// 目前不可达，保留用于未来多根检查点支持
 				if (
 					shouldUseMultiRoot({
 						workspaceManager: this.workspaceManager,
@@ -425,11 +878,15 @@ export class Task {
 			}
 		}
 
-		// Prepare effective API configuration
+		// ====================================================================
+		// API 处理器初始化
+		// ====================================================================
+		// 准备有效的 API 配置
 		const apiConfiguration = this.stateManager.getApiConfiguration()
 		const effectiveApiConfiguration: ApiConfiguration = {
 			...apiConfiguration,
 			ulid: this.ulid,
+			// API 重试回调：更新 UI 显示重试状态
 			onRetryAttempt: async (attempt: number, maxRetries: number, delay: number, error: any) => {
 				const clineMessages = this.messageStateHandler.getClineMessages()
 				const lastApiReqStartedIndex = findLastIndex(clineMessages, (m) => m.say === "api_req_started")
@@ -437,19 +894,19 @@ export class Task {
 					try {
 						const currentApiReqInfo: ClineApiReqInfo = JSON.parse(clineMessages[lastApiReqStartedIndex].text || "{}")
 						currentApiReqInfo.retryStatus = {
-							attempt: attempt, // attempt is already 1-indexed from retry.ts
-							maxAttempts: maxRetries, // total attempts
+							attempt: attempt, // attempt 已经是从 retry.ts 来的 1 索引
+							maxAttempts: maxRetries, // 总尝试次数
 							delaySec: Math.round(delay / 1000),
 							errorSnippet: error?.message ? `${String(error.message).substring(0, 50)}...` : undefined,
 						}
-						// Clear previous cancelReason and streamingFailedMessage if we are retrying
+						// 重试时清除之前的 cancelReason 和 streamingFailedMessage
 						delete currentApiReqInfo.cancelReason
 						delete currentApiReqInfo.streamingFailedMessage
 						await this.messageStateHandler.updateClineMessage(lastApiReqStartedIndex, {
 							text: JSON.stringify(currentApiReqInfo),
 						})
 
-						// Post the updated state to the webview so the UI reflects the retry attempt
+						// 将更新后的状态发布到 webview，使 UI 反映重试尝试
 						await this.postStateToWebview().catch((e) =>
 							Logger.error("Error posting state to webview in onRetryAttempt:", e),
 						)
@@ -462,14 +919,14 @@ export class Task {
 		const mode = this.stateManager.getGlobalSettingsKey("mode")
 		const currentProvider = mode === "plan" ? apiConfiguration.planModeApiProvider : apiConfiguration.actModeApiProvider
 
-		// Now that ulid is initialized, we can build the API handler
+		// ULID 初始化后，构建 API 处理器
 		this.api = buildApiHandler(effectiveApiConfiguration, mode)
 
-		// Set ulid on browserSession for telemetry tracking
+		// 在 browserSession 上设置 ulid 用于遥测追踪
 		this.browserSession.setUlid(this.ulid)
 
-		// Note: Task initialization (startTask/resumeTaskFromHistory) is now called
-		// from Controller.initTask() AFTER the task instance is fully assigned.
+		// 注意：任务初始化（startTask/resumeTaskFromHistory）现在在 Task 实例完全分配后
+		// 由 Controller.initTask() 调用，防止竞态条件（钩子在 controller.task 准备好之前运行）
 		// This prevents race conditions where hooks run before controller.task is ready.
 
 		// Set up focus chain file watcher (async, runs in background) only if focus chain is enabled
@@ -567,9 +1024,27 @@ export class Task {
 		)
 	}
 
-	// Communicate with webview
+	// ========================================================================
+	// Webview 通信方法
+	// ========================================================================
 
-	// partial has three valid states true (partial message), false (completion of partial message), undefined (individual complete message)
+	/**
+	 * 向用户询问并等待响应
+	 *
+	 * 这是 AI 代理与用户交互的主要方法之一。当 AI 需要用户确认、
+	 * 批准或输入时调用此方法。
+	 *
+	 * partial 参数有三种有效状态：
+	 * - true: 部分消息（流式传输中）
+	 * - false: 部分消息的完成版本
+	 * - undefined: 独立的完整消息
+	 *
+	 * @param type - 询问类型（如 tool、command、followup 等）
+	 * @param text - 询问文本内容
+	 * @param partial - 是否为部分消息
+	 * @returns 包含用户响应、文本、图片和文件的对象
+	 * @throws 如果任务已中止（除恢复类型询问外）
+	 */
 	async ask(
 		type: ClineAsk,
 		text?: string,
@@ -581,7 +1056,7 @@ export class Task {
 		files?: string[]
 		askTs?: number
 	}> {
-		// Allow resume asks even when aborted to enable resume button after cancellation
+		// 允许恢复类型的询问即使任务已中止，以支持取消后的恢复按钮
 		if (this.taskState.abort && type !== "resume_task" && type !== "resume_completed_task") {
 			throw new Error("Cline instance aborted")
 		}
@@ -700,6 +1175,17 @@ export class Task {
 		return result
 	}
 
+	/**
+	 * 处理来自 Webview 的询问响应
+	 *
+	 * 当用户在 UI 中响应 ask 请求时调用此方法。
+	 * 设置响应状态，使 ask 方法中的 pWaitFor 能够继续。
+	 *
+	 * @param askResponse - 用户的响应类型
+	 * @param text - 用户输入的文本
+	 * @param images - 用户附加的图片
+	 * @param files - 用户附加的文件
+	 */
 	async handleWebviewAskResponse(askResponse: ClineAskResponse, text?: string, images?: string[], files?: string[]) {
 		this.taskState.askResponse = askResponse
 		this.taskState.askResponseText = text
@@ -707,6 +1193,26 @@ export class Task {
 		this.taskState.askResponseFiles = files
 	}
 
+	/**
+	 * 向 Webview 发送消息（不等待响应）
+	 *
+	 * 这是 AI 代理向用户显示信息的主要方法。与 ask 不同，
+	 * say 不会等待用户响应，只是单向发送消息。
+	 *
+	 * 用于显示：
+	 * - AI 的文本响应
+	 * - 工具执行结果
+	 * - 错误消息
+	 * - 状态更新
+	 *
+	 * @param type - 消息类型（如 text、tool、error 等）
+	 * @param text - 消息文本内容
+	 * @param images - 附加的图片
+	 * @param files - 附加的文件
+	 * @param partial - 是否为部分消息
+	 * @returns 消息时间戳，如果是更新现有消息则返回 undefined
+	 * @throws 如果任务已中止（除钩子状态消息外）
+	 */
 	async say(
 		type: ClineSay,
 		text?: string,
@@ -714,7 +1220,7 @@ export class Task {
 		files?: string[],
 		partial?: boolean,
 	): Promise<number | undefined> {
-		// Allow hook messages even when aborted to enable proper cleanup
+		// 允许钩子消息即使任务已中止，以支持正确的清理
 		if (this.taskState.abort && type !== "hook_status" && type !== "hook_output_stream") {
 			throw new Error("Cline instance aborted")
 		}
@@ -810,6 +1316,21 @@ export class Task {
 		return sayTs
 	}
 
+	// ========================================================================
+	// 消息辅助方法
+	// ========================================================================
+
+	/**
+	 * 显示缺少参数错误并创建工具错误响应
+	 *
+	 * 当 AI 尝试使用工具但缺少必需参数时调用。
+	 * 向用户显示错误消息并返回格式化的错误响应。
+	 *
+	 * @param toolName - 工具名称
+	 * @param paramName - 缺少的参数名称
+	 * @param relPath - 相关文件路径（可选）
+	 * @returns 格式化的工具错误响应
+	 */
 	async sayAndCreateMissingParamError(toolName: ClineDefaultTool, paramName: string, relPath?: string) {
 		await this.say(
 			"error",
@@ -820,6 +1341,14 @@ export class Task {
 		return formatResponse.toolError(formatResponse.missingToolParameterError(paramName))
 	}
 
+	/**
+	 * 如果存在指定类型的部分消息则移除
+	 *
+	 * 用于清理流式传输过程中创建的部分消息。
+	 *
+	 * @param type - 消息类型（ask 或 say）
+	 * @param askOrSay - 具体的询问或说话类型
+	 */
 	async removeLastPartialMessageIfExistsWithType(type: "ask" | "say", askOrSay: ClineAsk | ClineSay) {
 		const clineMessages = this.messageStateHandler.getClineMessages()
 		const lastMessage = clineMessages.at(-1)
@@ -829,15 +1358,30 @@ export class Task {
 		}
 	}
 
+	// ========================================================================
+	// 检查点和回调方法
+	// ========================================================================
+
+	/**
+	 * 保存检查点回调
+	 *
+	 * 调用检查点管理器保存当前任务状态快照。
+	 *
+	 * @param isAttemptCompletionMessage - 是否为任务完成消息
+	 * @param completionMessageTs - 完成消息的时间戳
+	 */
 	private async saveCheckpointCallback(isAttemptCompletionMessage?: boolean, completionMessageTs?: number): Promise<void> {
 		return this.checkpointManager?.saveCheckpoint(isAttemptCompletionMessage, completionMessageTs) ?? Promise.resolve()
 	}
 
 	/**
-	 * Check if parallel tool calling is enabled.
-	 * Parallel tool calling is enabled if:
-	 * 1. User has enabled it in settings, OR
-	 * 2. The current model/provider supports native tool calling and handles parallel tools well
+	 * 检查并行工具调用是否启用
+	 *
+	 * 并行工具调用在以下情况下启用：
+	 * 1. 用户在设置中启用了它，或
+	 * 2. 当前模型/提供商支持原生工具调用且能良好处理并行工具
+	 *
+	 * @returns 是否启用并行工具调用
 	 */
 	private isParallelToolCallingEnabled(): boolean {
 		const enableParallelSetting = this.stateManager.getGlobalSettingsKey("enableParallelToolCalling")
@@ -845,37 +1389,52 @@ export class Task {
 		return isParallelToolCallingEnabled(enableParallelSetting, providerInfo)
 	}
 
+	/**
+	 * 切换到 Act 模式的回调
+	 *
+	 * 用于 YOLO 模式自动切换到执行模式。
+	 *
+	 * @returns 切换是否成功
+	 */
 	private async switchToActModeCallback(): Promise<boolean> {
 		return await this.controller.toggleActModeForYoloMode()
 	}
 
+	// ========================================================================
+	// 钩子处理方法
+	// ========================================================================
+
 	/**
-	 * Unified cancellation handler for hook-requested cancellations.
-	 * Ensures state is always saved before aborting, regardless of whether
-	 * the user clicked cancel or the hook returned {cancel: true}.
+	 * 统一的钩子取消处理器
 	 *
-	 * @param hookName The name of the hook for logging
-	 * @param wasCancelled Whether user clicked cancel (vs hook returning cancel: true)
+	 * 确保在中止之前始终保存状态，无论是用户点击取消
+	 * 还是钩子返回 {cancel: true}。
+	 *
+	 * @param hookName - 钩子名称（用于日志记录）
+	 * @param wasCancelled - 是否为用户点击取消（vs 钩子返回 cancel: true）
 	 */
 	private async handleHookCancellation(hookName: string, wasCancelled: boolean): Promise<void> {
-		// ALWAYS save state, regardless of cancellation source
+		// 无论取消来源如何，始终保存状态
 		this.taskState.didFinishAbortingStream = true
 
-		// Save conversation state to disk
+		// 将对话状态保存到磁盘
 		await this.messageStateHandler.saveClineMessagesAndUpdateHistory()
 		await this.messageStateHandler.overwriteApiConversationHistory(this.messageStateHandler.getApiConversationHistory())
 
-		// Update UI
+		// 更新 UI
 		await this.postStateToWebview()
 
-		// Log for debugging/telemetry
+		// 记录日志用于调试/遥测
 		Logger.log(`[Task ${this.taskId}] ${hookName} hook cancelled (userInitiated: ${wasCancelled})`)
 	}
 
 	/**
-	 * Calculate the new deleted range for PreCompact hook
-	 * @param apiConversationHistory The full API conversation history
-	 * @returns Tuple with start and end indices for the deleted range
+	 * 计算 PreCompact 钩子的新删除范围
+	 *
+	 * 用于确定在上下文压缩时应删除哪些历史消息。
+	 *
+	 * @param apiConversationHistory - 完整的 API 对话历史
+	 * @returns 包含起始和结束索引的元组
 	 */
 	private calculatePreCompactDeletedRange(apiConversationHistory: ClineStorageMessage[]): [number, number] {
 		const newDeletedRange = this.contextManager.getNextTruncationRange(
@@ -936,26 +1495,48 @@ export class Task {
 		}
 	}
 
-	// Task lifecycle
+	// ========================================================================
+	// 任务生命周期方法
+	// ========================================================================
 
+	/**
+	 * 启动新任务
+	 *
+	 * 这是创建全新任务的入口点。执行流程：
+	 * 1. 初始化 ClineIgnore 控制器
+	 * 2. 清空对话历史和消息
+	 * 3. 显示任务消息
+	 * 4. 运行 TaskStart 钩子
+	 * 5. 运行 UserPromptSubmit 钩子
+	 * 6. 记录环境元数据
+	 * 7. 进入任务循环
+	 *
+	 * @param task - 任务描述文本
+	 * @param images - 附加的图片路径数组
+	 * @param files - 附加的文件路径数组
+	 */
 	public async startTask(task?: string, images?: string[], files?: string[]): Promise<void> {
 		try {
 			await this.clineIgnoreController.initialize()
 		} catch (error) {
 			Logger.error("Failed to initialize ClineIgnoreController:", error)
-			// Optionally, inform the user or handle the error appropriately
+			// 可选：通知用户或适当处理错误
 		}
-		// conversationHistory (for API) and clineMessages (for webview) need to be in sync
-		// if the extension process were killed, then on restart the clineMessages might not be empty, so we need to set it to [] when we create a new Cline client (otherwise webview would show stale messages from previous session)
+
+		// conversationHistory（用于 API）和 clineMessages（用于 webview）需要同步
+		// 如果扩展进程被终止，重启时 clineMessages 可能不为空，
+		// 所以创建新 Cline 客户端时需要将其设为 []（否则 webview 会显示上一会话的过时消息）
 		this.messageStateHandler.setClineMessages([])
 		this.messageStateHandler.setApiConversationHistory([])
 
 		await this.postStateToWebview()
 
+		// 显示任务消息
 		await this.say("task", task, images, files)
 
 		this.taskState.isInitialized = true
 
+		// 格式化图片块
 		const imageBlocks: ClineImageContentBlock[] = formatResponse.imageBlocks(images)
 
 		const userContent: ClineUserContent[] = [
@@ -1060,18 +1641,31 @@ export class Task {
 		await this.initiateTaskLoop(userContent)
 	}
 
+	/**
+	 * 从历史记录恢复任务
+	 *
+	 * 这是恢复已有任务的入口点。执行流程：
+	 * 1. 初始化 ClineIgnore 控制器
+	 * 2. 加载保存的 Cline 消息和 API 对话历史
+	 * 3. 清理之前的恢复消息
+	 * 4. 显示恢复询问
+	 * 5. 等待用户点击恢复按钮
+	 * 6. 运行 TaskResume 和 UserPromptSubmit 钩子
+	 * 7. 构建恢复上下文
+	 * 8. 继续任务循环
+	 */
 	public async resumeTaskFromHistory() {
 		try {
 			await this.clineIgnoreController.initialize()
 		} catch (error) {
 			Logger.error("Failed to initialize ClineIgnoreController:", error)
-			// Optionally, inform the user or handle the error appropriately
+			// 可选：通知用户或适当处理错误
 		}
 
+		// 加载保存的 Cline 消息
 		const savedClineMessages = await getSavedClineMessages(this.taskId)
 
-		// Remove any resume messages that may have been added before
-
+		// 移除之前可能添加的恢复消息
 		const lastRelevantMessageIndex = findLastIndex(
 			savedClineMessages,
 			(m) => !(m.ask === "resume_task" || m.ask === "resume_completed_task"),
@@ -1331,25 +1925,41 @@ export class Task {
 		await this.initiateTaskLoop(newUserContent)
 	}
 
+	/**
+	 * 启动任务循环
+	 *
+	 * 这是 AI 代理的核心执行循环。工作方式：
+	 * 1. 给 Cline 一个任务
+	 * 2. Cline 调用工具来完成任务
+	 * 3. 除非有 attempt_completion 调用，否则继续响应工具结果
+	 * 4. 直到 Cline 调用 attempt_completion 或不再使用工具
+	 * 5. 如果不再使用工具，提示 Cline 考虑是否完成任务
+	 *
+	 * @param userContent - 初始用户内容
+	 */
 	private async initiateTaskLoop(userContent: ClineContent[]): Promise<void> {
 		let nextUserContent = userContent
 		let includeFileDetails = true
+
+		// 主循环：直到任务中止
 		while (!this.taskState.abort) {
 			const didEndLoop = await this.recursivelyMakeClineRequests(nextUserContent, includeFileDetails)
-			includeFileDetails = false // we only need file details the first time
+			includeFileDetails = false // 只在第一次需要文件详情
 
-			//  The way this agentic loop works is that cline will be given a task that he then calls tools to complete. unless there's an attempt_completion call, we keep responding back to him with his tool's responses until he either attempt_completion or does not use anymore tools. If he does not use anymore tools, we ask him to consider if he's completed the task and then call attempt_completion, otherwise proceed with completing the task.
+			// 代理循环的工作方式：
+			// Cline 被给予一个任务，然后调用工具来完成。
+			// 除非有 attempt_completion 调用，否则我们继续响应工具结果，
+			// 直到 Cline 调用 attempt_completion 或不再使用工具。
+			// 如果不再使用工具，我们要求他考虑是否完成任务，然后调用 attempt_completion，
+			// 否则继续完成任务。
 
-			//const totalCost = this.calculateApiCost(totalInputTokens, totalOutputTokens)
 			if (didEndLoop) {
-				// For now a task never 'completes'. This will only happen if the user hits max requests and denies resetting the count.
-				//this.say("task_completed", `Task completed. Total API usage cost: ${totalCost}`)
+				// 目前任务永不"完成"。这只会在用户达到最大请求数并拒绝重置计数时发生。
 				break
 			}
-			// this.say(
-			// 	"tool",
-			// 	"Cline responded with only text blocks but has not called attempt_completion yet. Forcing him to continue with task..."
-			// )
+
+			// 如果 Cline 只响应文本块但没有调用 attempt_completion，
+			// 强制他继续任务
 			nextUserContent = [
 				{
 					type: "text",
@@ -1361,34 +1971,45 @@ export class Task {
 	}
 
 	/**
-	 * Determines if the TaskCancel hook should run.
-	 * Only runs if there's actual active work happening or if work was started in this session.
-	 * Does NOT run when just showing the resume button or completion button with no active work.
-	 * @returns true if the hook should run, false otherwise
+	 * 判断是否应运行 TaskCancel 钩子
+	 *
+	 * 只有在实际有活动工作进行中或本会话已开始工作时才运行。
+	 * 仅显示恢复按钮或完成按钮（无活动工作）时不运行。
+	 *
+	 * 运行条件：
+	 * - 有活动的钩子执行
+	 * - API 正在流式传输
+	 * - 正在等待首个块
+	 * - 有活动的后台命令
+	 *
+	 * 不运行条件：
+	 * - 仅显示按钮状态（resume_task、resume_completed_task、completion_result）
+	 *
+	 * @returns 是否应运行钩子
 	 */
 	private async shouldRunTaskCancelHook(): Promise<boolean> {
-		// Atomically check for active hook execution (work happening now)
+		// 原子检查活动钩子执行（当前正在进行工作）
 		const activeHook = await this.getActiveHookExecution()
 		if (activeHook) {
 			return true
 		}
 
-		// Run if the API is currently streaming (work happening now)
+		// 如果 API 正在流式传输（当前正在进行工作）
 		if (this.taskState.isStreaming) {
 			return true
 		}
 
-		// Run if we're waiting for the first chunk (work happening now)
+		// 如果正在等待首个块（当前正在进行工作）
 		if (this.taskState.isWaitingForFirstChunk) {
 			return true
 		}
 
-		// Run if there's active background command (work happening now)
+		// 如果有活动的后台命令（当前正在进行工作）
 		if (this.commandExecutor.hasActiveBackgroundCommand()) {
 			return true
 		}
 
-		// Check if we're at a button-only state (no active work, just waiting for user action)
+		// 检查是否处于仅按钮状态（无活动工作，只是等待用户操作）
 		const clineMessages = this.messageStateHandler.getClineMessages()
 		const lastMessage = clineMessages.at(-1)
 		const isAtButtonOnlyState =
@@ -1412,11 +2033,25 @@ export class Task {
 		return true
 	}
 
+	/**
+	 * 中止任务执行
+	 *
+	 * 这是任务取消的主要入口点。执行分为多个阶段：
+	 *
+	 * 阶段 1：检查 TaskCancel 钩子是否应运行（在任何清理之前）
+	 * 阶段 2：设置中止标志以防止竞态条件
+	 * 阶段 3：取消任何正在运行的钩子执行
+	 * 阶段 4：运行 TaskCancel 钩子
+	 * 阶段 5：立即更新 UI 以反映中止状态
+	 * 阶段 6：检查未完成的进度（焦点链）
+	 * 阶段 7：清理资源（终端、浏览器、差异视图等）
+	 *
+	 * 在 finally 块中释放任务锁并发送最终状态更新。
+	 */
 	async abortTask() {
 		try {
-			// PHASE 1: Check if TaskCancel should run BEFORE any cleanup
-			// We must capture this state now because subsequent cleanup will
-			// clear the active work indicators that shouldRunTaskCancelHook checks
+			// 阶段 1：在任何清理之前检查 TaskCancel 是否应运行
+			// 必须现在捕获此状态，因为后续清理会清除 shouldRunTaskCancelHook 检查的活动工作指示器
 			const shouldRunTaskCancelHook = await this.shouldRunTaskCancelHook()
 
 			// PHASE 2: Set abort flag to prevent race conditions
@@ -1555,7 +2190,20 @@ export class Task {
 		}
 	}
 
-	// Tools
+	// ========================================================================
+	// 工具执行方法
+	// ========================================================================
+
+	/**
+	 * 执行命令工具
+	 *
+	 * 在终端中执行 shell 命令。
+	 *
+	 * @param command - 要执行的命令
+	 * @param timeoutSeconds - 超时时间（秒）
+	 * @param options - 命令执行选项
+	 * @returns 元组 [是否成功, 工具响应内容]
+	 */
 	async executeCommandTool(
 		command: string,
 		timeoutSeconds: number | undefined,
@@ -1565,16 +2213,20 @@ export class Task {
 	}
 
 	/**
-	 * Cancel a background command that is running in the background
-	 * @returns true if a command was cancelled, false if no command was running
+	 * 取消在后台运行的命令
+	 *
+	 * @returns 如果命令被取消返回 true，如果没有命令在运行返回 false
 	 */
 	public async cancelBackgroundCommand(): Promise<boolean> {
 		return this.commandExecutor.cancelBackgroundCommand()
 	}
 
 	/**
-	 * Cancel a currently running hook execution
-	 * @returns true if a hook was cancelled, false if no hook was running
+	 * 取消当前正在运行的钩子执行
+	 *
+	 * 中止钩子进程并更新钩子消息状态为"已取消"。
+	 *
+	 * @returns 如果钩子被取消返回 true，如果没有钩子在运行返回 false
 	 */
 	public async cancelHookExecution(): Promise<boolean> {
 		const activeHook = await this.getActiveHookExecution()
@@ -1585,10 +2237,10 @@ export class Task {
 		const { hookName, toolName, messageTs, abortController } = activeHook
 
 		try {
-			// Abort the hook process
+			// 中止钩子进程
 			abortController.abort()
 
-			// Update hook message status to "cancelled"
+			// 将钩子消息状态更新为"已取消"
 			const clineMessages = this.messageStateHandler.getClineMessages()
 			const hookMessageIndex = clineMessages.findIndex((m) => m.ts === messageTs)
 			if (hookMessageIndex !== -1) {
@@ -1596,7 +2248,7 @@ export class Task {
 					hookName,
 					toolName,
 					status: "cancelled",
-					exitCode: 130, // Standard SIGTERM exit code
+					exitCode: 130, // 标准 SIGTERM 退出码
 				}
 				await this.messageStateHandler.updateClineMessage(hookMessageIndex, {
 					text: JSON.stringify(cancelledMetadata),
