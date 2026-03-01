@@ -2392,8 +2392,37 @@ export class Task {
 		this.taskState.didAutomaticallyRetryFailedApiRequest = true
 	}
 
+	/**
+	 * 尝试发起 API 请求
+	 *
+	 * 这是调用大模型 API 的核心方法，执行以下步骤：
+	 * 1. 等待 MCP 服务器连接完成
+	 * 2. 收集环境信息和配置
+	 * 3. 加载各种规则文件（Cline 规则、Cursor 规则等）
+	 * 4. 发现并过滤可用的技能
+	 * 5. 构建系统提示词上下文
+	 * 6. 生成系统提示词和工具列表
+	 * 7. 管理上下文窗口（截断历史消息）
+	 * 8. 调用 API 并返回流式响应
+	 *
+	 * @param previousApiReqIndex - 上一个 API 请求在消息列表中的索引
+	 * @yields ApiStream - 流式响应块（文本、工具调用、使用统计等）
+	 *
+	 * @example
+	 * ```typescript
+	 * const stream = this.attemptApiRequest(previousApiReqIndex)
+	 * for await (const chunk of stream) {
+	 *   if (chunk.type === "text") {
+	 *     // 处理文本响应
+	 *   } else if (chunk.type === "tool_use") {
+	 *     // 处理工具调用
+	 *   }
+	 * }
+	 * ```
+	 */
 	async *attemptApiRequest(previousApiReqIndex: number): ApiStream {
-		// Wait for MCP servers to be connected before generating system prompt
+		// 等待 MCP 服务器连接完成后再生成系统提示词
+		// MCP 服务器提供额外的工具和资源
 		await pWaitFor(() => this.mcpHub.isConnecting !== true, {
 			timeout: 10_000,
 		}).catch(() => {
@@ -2516,16 +2545,27 @@ export class Task {
 			terminalExecutionMode: this.terminalExecutionMode,
 		}
 
-		// Notify user if any conditional rules were applied for this request
+		// 通知用户哪些条件规则被激活应用于此请求
 		const activatedConditionalRules = [...globalRules.activatedConditionalRules, ...localRules.activatedConditionalRules]
 		if (activatedConditionalRules.length > 0) {
 			await this.say("conditional_rules_applied", JSON.stringify({ rules: activatedConditionalRules }))
 		}
 
+		// ========================================================================
+		// 生成系统提示词和工具列表
+		// ========================================================================
+		// getSystemPrompt 根据 promptContext 生成完整的系统提示词
+		// 包含：基础能力说明、工具使用指南、规则、技能等
 		const { systemPrompt, tools } = await getSystemPrompt(promptContext)
 		this.useNativeToolCalls = !!tools?.length
+		// 将提示词元数据写入工件目录（用于调试）
 		await this.writePromptMetadataArtifacts({ systemPrompt, providerInfo })
 
+		// ========================================================================
+		// 上下文管理 - 处理对话历史截断
+		// ========================================================================
+		// 获取截断后的对话历史和元数据
+		// 当对话过长时，自动截断早期消息以适应模型上下文窗口
 		const contextManagementMetadata = await this.contextManager.getNewContextMessagesAndMetadata(
 			this.messageStateHandler.getApiConversationHistory(),
 			this.messageStateHandler.getClineMessages(),
@@ -2536,19 +2576,25 @@ export class Task {
 			this.stateManager.getGlobalSettingsKey("useAutoCondense") && isNextGenModelFamily(this.api.getModel().id),
 		)
 
+		// 如果截断范围更新，保存状态
 		if (contextManagementMetadata.updatedConversationHistoryDeletedRange) {
 			this.taskState.conversationHistoryDeletedRange = contextManagementMetadata.conversationHistoryDeletedRange
 			await this.messageStateHandler.saveClineMessagesAndUpdateHistory()
-			// saves task history item which we use to keep track of conversation history deleted range
 		}
 
-		// Response API requires native tool calls to be enabled
+		// ========================================================================
+		// 调用大模型 API - 核心调用点
+		// ========================================================================
+		// 这是实际调用大模型 API 的地方
+		// 传入系统提示词、截断后的对话历史和可用工具
+		// 返回一个异步迭代器用于流式接收响应
 		const stream = this.api.createMessage(systemPrompt, contextManagementMetadata.truncatedConversationHistory, tools)
 
 		const iterator = stream[Symbol.asyncIterator]()
 
 		try {
-			// awaiting first chunk to see if it will throw an error
+			// 等待第一个响应块，检查是否会抛出错误
+			// 这允许我们在流开始前捕获连接错误
 			this.taskState.isWaitingForFirstChunk = true
 			const firstChunk = await iterator.next()
 			yield firstChunk.value
@@ -2867,17 +2913,39 @@ export class Task {
 		}
 	}
 
+	/**
+	 * 递归执行 Cline 请求
+	 *
+	 * 这是 AI 代理循环的核心方法，负责：
+	 * 1. 发送用户内容到大模型
+	 * 2. 接收并处理模型的流式响应
+	 * 3. 执行模型请求的工具调用
+	 * 4. 将工具结果作为新的用户内容继续对话
+	 *
+	 * 方法名中的 "recursively" 指的是逻辑上的递归：
+	 * - 发送请求 → 收到工具调用 → 执行工具 → 发送结果 → 循环
+	 *
+	 * 终止条件：
+	 * - 模型调用 attempt_completion 工具表示任务完成
+	 * - 用户取消任务
+	 * - 达到最大请求数限制
+	 * - 发生不可恢复的错误
+	 *
+	 * @param userContent - 要发送给模型的用户内容（文本、图片等）
+	 * @param includeFileDetails - 是否在首次请求中包含详细文件信息
+	 * @returns boolean - true 表示循环结束，false 表示需要继续
+	 */
 	async recursivelyMakeClineRequests(userContent: ClineContent[], includeFileDetails = false): Promise<boolean> {
-		// Check abort flag at the very start to prevent any execution after cancellation
+		// 在方法开始时检查中止标志，防止取消后继续执行
 		if (this.taskState.abort) {
 			throw new Error("Task instance aborted")
 		}
 
-		// Increment API request counter for focus chain list management
+		// 增加 API 请求计数器，用于焦点链列表管理和 TODO 更新追踪
 		this.taskState.apiRequestCount++
 		this.taskState.apiRequestsSinceLastTodoUpdate++
 
-		// Used to know what models were used in the task if user wants to export metadata for error reporting purposes
+		// 记录模型使用情况，用于导出元数据进行错误报告
 		const { model, providerId, customPrompt, mode } = this.getCurrentProviderInfo()
 		if (providerId && model.id) {
 			try {
@@ -2885,6 +2953,7 @@ export class Task {
 			} catch {}
 		}
 
+		// 构建模型信息对象，用于消息显示
 		const modelInfo: ClineMessageModelInfo = {
 			modelId: model.id,
 			providerId: providerId,

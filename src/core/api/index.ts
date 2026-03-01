@@ -1,8 +1,56 @@
+/**
+ * @fileoverview API 处理器工厂 - 大模型 API 调用的抽象层
+ *
+ * 本文件是 Cline 与各种大模型 API 交互的核心抽象层。
+ * 它定义了统一的 API 处理器接口，并提供工厂函数来创建具体的处理器实例。
+ *
+ * 架构说明：
+ * ┌─────────────────┐
+ * │  Task.attemptApiRequest()  │
+ * └────────┬────────┘
+ *          │ 调用
+ *          ▼
+ * ┌─────────────────┐
+ * │  this.api.createMessage()  │  ← ApiHandler 接口
+ * └────────┬────────┘
+ *          │ 实际实现
+ *          ▼
+ * ┌─────────────────────────────────────────┐
+ * │         具体 Provider Handler           │
+ * │  (Anthropic/OpenAI/Gemini/Ollama/...)  │
+ * └─────────────────────────────────────────┘
+ *
+ * 支持的 API 提供商：
+ * - Anthropic (Claude 系列)
+ * - OpenAI (GPT 系列)
+ * - OpenRouter (多模型聚合)
+ * - Google (Gemini 系列)
+ * - Ollama (本地模型)
+ * - 以及更多...
+ *
+ * 主要功能：
+ * 1. 统一的 API 接口定义 (ApiHandler)
+ * 2. 根据配置创建对应的处理器实例 (buildApiHandler)
+ * 3. 支持 Plan/Act 双模式的模型配置
+ * 4. 流式响应处理 (ApiStream)
+ */
+
+// ==================== 外部依赖导入 ====================
+
+// API 配置和模型信息类型
 import { ApiConfiguration, ModelInfo, QwenApiRegions } from "@shared/api"
+// 模式类型（plan/act）
 import { Mode } from "@shared/storage/types"
+// 消息存储类型
 import { ClineStorageMessage } from "@/shared/messages/content"
+// 日志服务
 import { Logger } from "@/shared/services/Logger"
+// 工具定义类型
 import { ClineTool } from "@/shared/tools"
+
+// ==================== API 提供商处理器导入 ====================
+// 每个处理器对应一个 API 提供商的具体实现
+
 import { AIhubmixHandler } from "./providers/aihubmix"
 import { AnthropicHandler } from "./providers/anthropic"
 import { AskSageHandler } from "./providers/asksage"
@@ -44,34 +92,129 @@ import { VertexHandler } from "./providers/vertex"
 import { VsCodeLmHandler } from "./providers/vscode-lm"
 import { XAIHandler } from "./providers/xai"
 import { ZAiHandler } from "./providers/zai"
+// 流式响应类型
 import { ApiStream, ApiStreamUsageChunk } from "./transform/stream"
 
+// ==================== 类型定义 ====================
+
+/**
+ * 通用 API 处理器选项
+ *
+ * 所有 API 处理器共享的配置选项
+ */
 export type CommonApiHandlerOptions = {
+	/** 重试尝试回调，用于记录重试信息 */
 	onRetryAttempt?: ApiConfiguration["onRetryAttempt"]
 }
+
+/**
+ * API 处理器接口
+ *
+ * 定义了所有 API 提供商必须实现的统一接口。
+ * 这是与大模型交互的核心抽象。
+ */
 export interface ApiHandler {
+	/**
+	 * 创建消息并获取模型响应
+	 *
+	 * 这是调用大模型 API 的核心方法。发送系统提示词、对话历史和可用工具，
+	 * 返回一个异步迭代器用于流式接收响应。
+	 *
+	 * @param systemPrompt - 系统提示词，定义 AI 的行为和能力
+	 * @param messages - 对话历史消息列表
+	 * @param tools - 可选的工具列表，AI 可以调用这些工具
+	 * @param useResponseApi - 是否使用 Response API（OpenAI 特有）
+	 * @returns ApiStream - 异步迭代器，产生流式响应块
+	 */
 	createMessage(systemPrompt: string, messages: ClineStorageMessage[], tools?: ClineTool[], useResponseApi?: boolean): ApiStream
+
+	/**
+	 * 获取当前使用的模型信息
+	 *
+	 * @returns 包含模型 ID 和详细信息的对象
+	 */
 	getModel(): ApiHandlerModel
+
+	/**
+	 * 获取 API 流的使用情况统计
+	 *
+	 * @returns Token 使用统计信息
+	 */
 	getApiStreamUsage?(): Promise<ApiStreamUsageChunk | undefined>
+
+	/**
+	 * 中止当前 API 请求
+	 *
+	 * 用于用户取消操作时立即停止 API 调用
+	 */
 	abort?(): void
 }
 
+/**
+ * API 处理器模型信息
+ *
+ * 描述当前使用的模型
+ */
 export interface ApiHandlerModel {
+	/** 模型 ID（如 "claude-4-opus-20250514"） */
 	id: string
+	/** 模型详细信息（上下文窗口大小、价格等） */
 	info: ModelInfo
 }
 
+/**
+ * API 提供商信息
+ *
+ * 描述当前使用的 API 提供商和模型配置
+ */
 export interface ApiProviderInfo {
+	/** 提供商 ID（如 "anthropic", "openai"） */
 	providerId: string
+	/** 模型信息 */
 	model: ApiHandlerModel
+	/** 当前模式（"plan" 或 "act"） */
 	mode: Mode
-	customPrompt?: string // "compact"
+	/** 自定义提示词类型（如 "compact"） */
+	customPrompt?: string
 }
 
+/**
+ * 单次补全处理器接口
+ *
+ * 用于简单的单次补全请求，不涉及对话历史
+ */
 export interface SingleCompletionHandler {
+	/**
+	 * 完成提示词
+	 *
+	 * @param prompt - 输入提示词
+	 * @returns 模型生成的响应文本
+	 */
 	completePrompt(prompt: string): Promise<string>
 }
 
+/**
+ * 根据提供商创建对应的 API 处理器
+ *
+ * 这是一个工厂函数，根据 apiProvider 参数创建对应的处理器实例。
+ * 每个提供商都有自己的处理器类，实现了 ApiHandler 接口。
+ *
+ * 支持的提供商包括：
+ * - anthropic: Anthropic Claude 系列模型
+ * - openrouter: OpenRouter 多模型聚合平台
+ * - bedrock: AWS Bedrock 服务
+ * - vertex: Google Cloud Vertex AI
+ * - openai: OpenAI GPT 系列模型
+ * - ollama: 本地 Ollama 模型
+ * - gemini: Google Gemini 模型
+ * - deepseek: DeepSeek 模型
+ * - 以及更多...
+ *
+ * @param apiProvider - API 提供商标识符
+ * @param options - API 配置选项（不包含 apiProvider）
+ * @param mode - 当前模式（"plan" 或 "act"）
+ * @returns ApiHandler - 对应提供商的处理器实例
+ */
 function createHandlerForProvider(
 	apiProvider: string | undefined,
 	options: Omit<ApiConfiguration, "apiProvider">,
@@ -462,19 +605,47 @@ function createHandlerForProvider(
 	}
 }
 
+/**
+ * 构建 API 处理器
+ *
+ * 这是创建 API 处理器的主要入口函数。根据配置选择合适的提供商处理器，
+ * 并进行必要的参数验证和调整。
+ *
+ * 工作流程：
+ * 1. 根据模式（plan/act）选择对应的 API 提供商
+ * 2. 验证思考预算 tokens 不超过模型最大 tokens
+ * 3. 创建并返回对应的处理器实例
+ *
+ * @param configuration - API 配置，包含所有提供商的配置信息
+ * @param mode - 当前模式，"plan"（规划模式）或 "act"（执行模式）
+ * @returns ApiHandler - 对应提供商的处理器实例
+ *
+ * @example
+ * ```typescript
+ * const handler = buildApiHandler(apiConfig, "act")
+ * const stream = handler.createMessage(systemPrompt, messages, tools)
+ * for await (const chunk of stream) {
+ *   // 处理流式响应
+ * }
+ * ```
+ */
 export function buildApiHandler(configuration: ApiConfiguration, mode: Mode): ApiHandler {
+	// 解构配置，分离提供商信息和其他选项
 	const { planModeApiProvider, actModeApiProvider, ...options } = configuration
 
+	// 根据模式选择对应的 API 提供商
 	const apiProvider = mode === "plan" ? planModeApiProvider : actModeApiProvider
 
-	// Validate thinking budget tokens against model's maxTokens to prevent API errors
-	// wrapped in a try-catch for safety, but this should never throw
+	// 验证思考预算 tokens，防止超过模型最大 tokens 导致 API 错误
+	// 使用 try-catch 包装以确保安全，但正常情况下不应抛出异常
 	try {
 		const thinkingBudgetTokens = mode === "plan" ? options.planModeThinkingBudgetTokens : options.actModeThinkingBudgetTokens
 		if (thinkingBudgetTokens && thinkingBudgetTokens > 0) {
+			// 创建临时处理器以获取模型信息
 			const handler = createHandlerForProvider(apiProvider, options, mode)
 
 			const modelInfo = handler.getModel().info
+			// 如果思考预算超过模型最大 tokens，进行裁剪
 			if (modelInfo?.maxTokens && modelInfo.maxTokens > 0 && thinkingBudgetTokens > modelInfo.maxTokens) {
 				const clippedValue = modelInfo.maxTokens - 1
 				if (mode === "plan") {
@@ -483,12 +654,14 @@ export function buildApiHandler(configuration: ApiConfiguration, mode: Mode): Ap
 					options.actModeThinkingBudgetTokens = clippedValue
 				}
 			} else {
-				return handler // don't rebuild unless its necessary
+				// 如果无需调整，直接返回已创建的处理器，避免重复创建
+				return handler
 			}
 		}
 	} catch (error) {
 		Logger.error("buildApiHandler error:", error)
 	}
 
+	// 创建并返回最终的处理器实例
 	return createHandlerForProvider(apiProvider, options, mode)
 }
